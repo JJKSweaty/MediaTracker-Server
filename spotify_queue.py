@@ -515,6 +515,35 @@ class SpotifyQueueManager:
         """Skip to previous track."""
         return self._api_post("/me/player/previous") is not None
     
+    def set_shuffle(self, state: bool) -> bool:
+        """Set shuffle mode on/off."""
+        return self._api_put(f"/me/player/shuffle?state={'true' if state else 'false'}")
+    
+    def set_repeat(self, state: str) -> bool:
+        """
+        Set repeat mode.
+        state: "track" (repeat one), "context" (repeat all), or "off"
+        """
+        if state not in ("track", "context", "off"):
+            state = "off"
+        return self._api_put(f"/me/player/repeat?state={state}")
+    
+    def check_saved_tracks(self, track_ids: list) -> list:
+        """Check if tracks are saved in user's library. Returns list of booleans."""
+        # Extract IDs if full URIs
+        ids = []
+        for tid in track_ids:
+            if tid.startswith("spotify:track:"):
+                ids.append(tid.split(":")[-1])
+            else:
+                ids.append(tid)
+        
+        if not ids:
+            return []
+        
+        data = self._api_get("/me/tracks/contains", {"ids": ",".join(ids[:50])})  # Max 50
+        return data if isinstance(data, list) else []
+    
     # ========== PLAYLIST MODIFICATION ==========
     
     def remove_track_from_playlist(self, playlist_id: str, track_uri: str, snapshot_id: Optional[str] = None) -> Optional[str]:
@@ -614,6 +643,20 @@ class SpotifyQueueManager:
         if track_id.startswith("spotify:track:"):
             track_id = track_id.split(":")[-1]
         return self._api_delete(f"/me/tracks?ids={track_id}")
+    
+    def add_to_playlist(self, playlist_id: str, track_uris: List[str]) -> bool:
+        """Add tracks to a playlist.
+        
+        Args:
+            playlist_id: Spotify playlist ID or URI
+            track_uris: List of track URIs (e.g., ["spotify:track:xxx"])
+        """
+        # Extract playlist ID from URI if needed
+        if playlist_id.startswith("spotify:playlist:"):
+            playlist_id = playlist_id.split(":")[-1]
+        
+        # POST /playlists/{playlist_id}/tracks with body {"uris": [...]}
+        return self._api_post(f"/playlists/{playlist_id}/tracks", {"uris": track_uris})
     
     # ========== RECENTLY PLAYED ==========
     

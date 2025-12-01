@@ -600,6 +600,115 @@ def _handle_like_track(cmd: dict):
         print(f"[LIKE CMD] Error: {e}")
 
 
+def _handle_like(cmd: dict):
+    """
+    Handle like/unlike toggle for the current playing track from ESP32.
+    Commands:
+      - {"cmd": "like", "state": true}   (save to library)
+      - {"cmd": "like", "state": false}  (remove from library)
+    """
+    state = cmd.get("state", False)
+    
+    try:
+        queue_mgr = get_queue_manager()
+        # Get current track ID from playback state
+        playback = queue_mgr.get_playback_state()
+        if not playback or not playback.get("item"):
+            print("[LIKE] No track currently playing")
+            return
+        
+        track_id = playback["item"].get("id", "")
+        if not track_id:
+            print("[LIKE] Could not get track ID")
+            return
+        
+        if state:
+            success = queue_mgr.save_track(track_id)
+            print(f"[LIKE] Saved track {track_id}: {'OK' if success else 'FAIL'}")
+        else:
+            success = queue_mgr.remove_saved_track(track_id)
+            print(f"[LIKE] Removed track {track_id}: {'OK' if success else 'FAIL'}")
+            
+    except Exception as e:
+        print(f"[LIKE] Error: {e}")
+
+
+def _handle_add_to_playlist(cmd: dict):
+    """
+    Handle add current track to playlist from ESP32.
+    Commands:
+      - {"cmd": "add_to_playlist"}
+      - {"cmd": "add_to_playlist", "playlist_id": "spotify:playlist:XXX"}
+    
+    If no playlist_id is provided, adds to the user's "Liked Songs" or first playlist.
+    """
+    playlist_id = cmd.get("playlist_id", "")
+    
+    try:
+        queue_mgr = get_queue_manager()
+        
+        # Get current track ID from playback state
+        playback = queue_mgr.get_playback_state()
+        if not playback or not playback.get("item"):
+            print("[ADD PLAYLIST] No track currently playing")
+            return
+        
+        track_uri = playback["item"].get("uri", "")
+        if not track_uri:
+            print("[ADD PLAYLIST] Could not get track URI")
+            return
+        
+        # If no playlist specified, save to user's library (Liked Songs)
+        if not playlist_id:
+            track_id = playback["item"].get("id", "")
+            if track_id:
+                success = queue_mgr.save_track(track_id)
+                print(f"[ADD PLAYLIST] Saved to Liked Songs: {'OK' if success else 'FAIL'}")
+            return
+        
+        # Add to specific playlist
+        success = queue_mgr.add_to_playlist(playlist_id, [track_uri])
+        print(f"[ADD PLAYLIST] Added to playlist: {'OK' if success else 'FAIL'}")
+            
+    except Exception as e:
+        print(f"[ADD PLAYLIST] Error: {e}")
+
+
+def _handle_shuffle(cmd: dict):
+    """
+    Handle shuffle toggle from ESP32.
+    Commands:
+      - {"cmd": "shuffle", "state": true}
+      - {"cmd": "shuffle", "state": false}
+    """
+    state = cmd.get("state", False)
+    
+    try:
+        queue_mgr = get_queue_manager()
+        success = queue_mgr.set_shuffle(state)
+        print(f"[SHUFFLE] Set to {state}: {'OK' if success else 'FAIL'}")
+    except Exception as e:
+        print(f"[SHUFFLE] Error: {e}")
+
+
+def _handle_repeat(cmd: dict):
+    """
+    Handle repeat mode change from ESP32.
+    Commands:
+      - {"cmd": "repeat", "state": "off"}
+      - {"cmd": "repeat", "state": "track"}    (repeat one)
+      - {"cmd": "repeat", "state": "context"}  (repeat all)
+    """
+    state = cmd.get("state", "off")
+    
+    try:
+        queue_mgr = get_queue_manager()
+        success = queue_mgr.set_repeat(state)
+        print(f"[REPEAT] Set to {state}: {'OK' if success else 'FAIL'}")
+    except Exception as e:
+        print(f"[REPEAT] Error: {e}")
+
+
 def _process_esp_command(cmd: dict):
     """
     Process a command received from ESP32 via transport manager.
@@ -696,6 +805,14 @@ def _process_esp_command(cmd: dict):
         _handle_playlist_action(cmd)
     elif typ == "like_track":
         _handle_like_track(cmd)
+    elif typ == "like":
+        _handle_like(cmd)
+    elif typ == "add_to_playlist":
+        _handle_add_to_playlist(cmd)
+    elif typ == "shuffle":
+        _handle_shuffle(cmd)
+    elif typ == "repeat":
+        _handle_repeat(cmd)
     else:
         if SERIAL_DEBUG:
             print(f"[ESP CMD] Unknown cmd: {cmd}")
@@ -1391,9 +1508,16 @@ def get_media_snapshot():
             sp_position = spotify_data.get("progress_ms", 0) // 1000
             sp_playing = spotify_data.get("is_playing", False)  # True = playing, False = paused
             
+            # Get shuffle/repeat state from playback data
+            sp_shuffle = spotify_data.get("shuffle_state", False)
+            sp_repeat = spotify_data.get("repeat_state", "off")  # "off", "track", "context"
+            
             # Get artwork
             sp_images = item.get("album", {}).get("images", [])
             sp_artwork = sp_images[0].get("url") if sp_images else None
+            
+            # Get track URI for like checking
+            sp_track_uri = item.get("uri", "")
             
             media = {
                 "title": sp_title,
@@ -1405,7 +1529,19 @@ def get_media_snapshot():
                 "source": "spotify",
                 "has_artwork": sp_artwork is not None,
                 "artwork_url": sp_artwork,
+                "shuffle": sp_shuffle,
+                "repeat": sp_repeat,  # "off", "track", "context"
+                "track_uri": sp_track_uri,
             }
+            
+            # Check if current track is liked (cached to avoid excessive API calls)
+            try:
+                queue_mgr = get_queue_manager()
+                if sp_track_uri:
+                    liked = queue_mgr.check_saved_tracks([sp_track_uri])
+                    media["is_liked"] = liked[0] if liked else False
+            except Exception:
+                media["is_liked"] = False
             
             # Add queue data for Spotify (limit to 5 items to save ESP32 memory)
             try:
