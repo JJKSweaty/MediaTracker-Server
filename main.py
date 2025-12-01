@@ -18,6 +18,14 @@ import datetime
 import time
 import serial
 from serial import SerialException, SerialTimeoutException
+
+# GPU monitoring (optional - works with NVIDIA GPUs)
+try:
+    import GPUtil
+    HAS_GPU = True
+except ImportError:
+    HAS_GPU = False
+    print("[INFO] GPUtil not installed - GPU monitoring disabled. Install with: pip install GPUtil")
 # ===============================
 
 load_dotenv()
@@ -74,10 +82,24 @@ def get_system_snapshot():
     now = datetime.datetime.now()
     data["local_time"] = int(now.timestamp())
 
-    # CPU and memory
-    data["cpu_percent_total"] = psutil.cpu_percent(interval=0.1)
+    # CPU and memory (use shorter interval for faster updates)
+    data["cpu_percent_total"] = psutil.cpu_percent(interval=0.05)
     mem = psutil.virtual_memory()
     data["mem_percent"] = mem.percent
+
+    # GPU monitoring (NVIDIA only via GPUtil)
+    if HAS_GPU:
+        try:
+            gpus = GPUtil.getGPUs()
+            if gpus:
+                # Use first GPU's load percentage
+                data["gpu_percent"] = gpus[0].load * 100
+            else:
+                data["gpu_percent"] = 0.0
+        except Exception:
+            data["gpu_percent"] = 0.0
+    else:
+        data["gpu_percent"] = 0.0
 
     # Battery
     battery = psutil.sensors_battery()
@@ -88,13 +110,26 @@ def get_system_snapshot():
         data["battery_percent"] = None
         data["power_plugged"] = None
 
-    # Processes: collect CPU usage for each process and pick top 5 by CPU.
+    # Per-process CPU (normalized by core count)
+    n_cpus = psutil.cpu_count(logical=True) or 1
+
     processes = []
     for proc in psutil.process_iter(["pid", "name"]):
         try:
-            cpu_p = proc.cpu_percent(interval=None)
             name = proc.info.get("name") or ""
-            processes.append((cpu_p, name))
+            # Skip idle/system idle noise
+            if name.lower() in ("system idle process", "idle"):
+                continue
+
+            cpu_p = proc.cpu_percent(interval=None) / n_cpus
+            # Clamp to [0, 100] for display sanity
+            if cpu_p < 0:
+                cpu_p = 0.0
+            if cpu_p > 100.0:
+                cpu_p = 100.0
+
+            if cpu_p > 0.1:
+                processes.append((cpu_p, name))
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
 
@@ -499,8 +534,8 @@ if __name__ == "__main__":
     # Prime psutil counters
     prime_psutil()
 
-    # Start background system monitor
-    socketio.start_background_task(system_monitor_loop, 2)
+    # Start background system monitor (0.25s = 4 Hz for real-time feel)
+    socketio.start_background_task(system_monitor_loop, 0.25)
 
     print("[SERVER RUNNING] Flask-SocketIO on port 8080...")
     # IMPORTANT: no reloader, single process => only one serial owner
