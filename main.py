@@ -76,8 +76,13 @@ print(f"[CONFIG] SERIAL_PORT={SERIAL_PORT} BAUD={SERIAL_BAUD}")
 
 
 # === TASK MANAGER ADDITIONS ===
+# Cache for expensive process list (only update every 2 seconds)
+_proc_cache = {"data": [], "last_update": 0}
+_PROC_CACHE_TTL = 2.0
+
 def get_system_snapshot():
     """Return a task-manager style snapshot for the UI and ESP."""
+    global _proc_cache
     data = {}
 
     # Time info
@@ -89,8 +94,8 @@ def get_system_snapshot():
     now = datetime.datetime.now()
     data["local_time"] = int(now.timestamp())
 
-    # CPU and memory (use shorter interval for faster updates)
-    data["cpu_percent_total"] = psutil.cpu_percent(interval=0.05)
+    # CPU and memory (non-blocking - uses cached value from last call)
+    data["cpu_percent_total"] = psutil.cpu_percent(interval=None)
     mem = psutil.virtual_memory()
     data["mem_percent"] = mem.percent
 
@@ -117,34 +122,41 @@ def get_system_snapshot():
         data["battery_percent"] = None
         data["power_plugged"] = None
 
-    # Per-process Memory percentage (normalized by machine) for top processes
-    n_cpus = psutil.cpu_count(logical=True) or 1
+    # Per-process Memory percentage - cache this since it's expensive
+    now = time.time()
+    if now - _proc_cache["last_update"] > _PROC_CACHE_TTL:
+        # Time to refresh process list
+        n_cpus = psutil.cpu_count(logical=True) or 1
+        processes = []
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                name = proc.info.get("name") or ""
+                # Skip idle/system idle noise
+                if name.lower() in ("system idle process", "idle"):
+                    continue
 
-    processes = []
-    for proc in psutil.process_iter(["pid", "name"]):
-        try:
-            name = proc.info.get("name") or ""
-            # Skip idle/system idle noise
-            if name.lower() in ("system idle process", "idle"):
+                # Use memory percentage for sorting
+                try:
+                    mem_p = proc.memory_percent()
+                except Exception:
+                    mem_p = 0.0
+                # Clamp to [0, 100] for display sanity
+                if mem_p < 0:
+                    mem_p = 0.0
+                if mem_p > 100.0:
+                    mem_p = 100.0
+
+                if mem_p > 0.1:
+                    processes.append((mem_p, proc.pid, name))
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                 continue
 
-            # Use memory percentage for sorting
-            try:
-                mem_p = proc.memory_percent()
-            except Exception:
-                mem_p = 0.0
-            # Clamp to [0, 100] for display sanity
-            if mem_p < 0:
-                mem_p = 0.0
-            if mem_p > 100.0:
-                mem_p = 100.0
+        procs_sorted = sorted(processes, key=lambda x: x[0], reverse=True)[:5]
+        _proc_cache["data"] = procs_sorted
+        _proc_cache["last_update"] = now
+    else:
+        procs_sorted = _proc_cache["data"]
 
-            if mem_p > 0.1:
-                processes.append((mem_p, proc.pid, name))
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            continue
-
-    procs_sorted = sorted(processes, key=lambda x: x[0], reverse=True)[:5]
     # Provide both a backward-compatible `cpu_top5_process` (string list) and a richer 'proc_top5'
     data["cpu_top5_process"] = [f"{p[0]:.1f}% {p[2]}" for p in procs_sorted]
     # Rich object list for the ESP to parse PID + mem% + name
@@ -152,40 +164,110 @@ def get_system_snapshot():
     return data
 
 
+# Artwork fetching state (shared between threads)
+_artwork_state = {
+    "pending_url": None,
+    "ready_b64": None,
+    "ready_url": None,
+    "fetching": False
+}
+_artwork_lock = threading.Lock()
+
+def artwork_fetch_worker():
+    """Background thread that fetches artwork without blocking main loop."""
+    global _artwork_state
+    print("[ARTWORK WORKER] Thread started")
+    while True:
+        url_to_fetch = None
+        
+        with _artwork_lock:
+            if _artwork_state["pending_url"] and not _artwork_state["fetching"]:
+                url_to_fetch = _artwork_state["pending_url"]
+                _artwork_state["fetching"] = True
+        
+        if url_to_fetch:
+            try:
+                print(f"[ARTWORK WORKER] Fetching: {url_to_fetch[:60]}...")
+                b64 = get_artwork_png_b64(url_to_fetch)
+                with _artwork_lock:
+                    if b64:
+                        _artwork_state["ready_b64"] = b64
+                        _artwork_state["ready_url"] = url_to_fetch
+                        print(f"[ARTWORK WORKER] Ready! {len(b64)} chars")
+                    else:
+                        print("[ARTWORK WORKER] Failed to get b64")
+                    _artwork_state["fetching"] = False
+                    _artwork_state["pending_url"] = None
+            except Exception as e:
+                print(f"[ARTWORK WORKER] Error: {e}")
+                import traceback
+                traceback.print_exc()
+                with _artwork_lock:
+                    _artwork_state["fetching"] = False
+                    _artwork_state["pending_url"] = None
+        
+        time.sleep(0.1)
+
+# Start artwork worker thread
+_artwork_thread = threading.Thread(target=artwork_fetch_worker, daemon=True)
+_artwork_thread.start()
+
+
 def system_monitor_loop(interval=2):
     """Background loop that broadcasts system info over Socket.IO and serial."""
-    global ser
+    global ser, _artwork_state
+    last_artwork_url = None
+    artwork_sent_url = None
+    
     while True:
+        loop_start = time.time()
+        
         snapshot = get_system_snapshot()
 
-        # NEW: attach media block from Spotify / metadata globals
+        # Attach media block from metadata globals
         media = get_media_snapshot()
         artwork_url = None
+        
         if media is not None:
-            artwork_url = media.pop("artwork_url", None)  # Remove URL from JSON (sent separately)
+            artwork_url = media.pop("artwork_url", None)
             
-            # Add PNG artwork as base64 directly in the JSON (only if we have a URL)
-            if artwork_url:
-                if SERIAL_DEBUG:
-                    print(f"[ARTWORK] Fetching from: {artwork_url[:80]}...")
-                png_b64 = get_artwork_png_b64(artwork_url)
-                if png_b64:
-                    media["artwork_png_b64"] = png_b64
+            # Request artwork fetch in background (non-blocking)
+            if artwork_url and artwork_url != last_artwork_url:
+                with _artwork_lock:
+                    if not _artwork_state["fetching"]:
+                        _artwork_state["pending_url"] = artwork_url
+                        last_artwork_url = artwork_url
+                        if SERIAL_DEBUG:
+                            print(f"[ARTWORK] Queued for fetch: {artwork_url[:60]}...")
             
             snapshot["media"] = media
 
         # 1) Emit to web clients via Socket.IO
         socketio.emit("system_info", snapshot)
 
-        # 2) Send to ESP via serial as newline-terminated JSON
+        # 2) Send to ESP via serial as newline-terminated JSON (fast, no artwork)
         if ser is not None:
             try:
                 line = json.dumps(snapshot) + "\n"
+                line_bytes = line.encode("utf-8")
+                
                 if SERIAL_DEBUG:
-                    # Truncate for debug display (artwork can be large)
-                    display_line = line[:200] + "..." if len(line) > 200 else line.strip()
-                    print(f"[SERIAL OUT] {display_line}")
-                ser.write(line.encode("utf-8"))
+                    loop_time = (time.time() - loop_start) * 1000
+                    print(f"[LOOP] {loop_time:.0f}ms, JSON size: {len(line_bytes)} bytes")
+                
+                ser.write(line_bytes)
+                
+                # Check if artwork is ready to send
+                with _artwork_lock:
+                    ready_b64 = _artwork_state["ready_b64"]
+                    ready_url = _artwork_state["ready_url"]
+                
+                if ready_b64 and ready_url and ready_url != artwork_sent_url:
+                    print(f"[ARTWORK] Sending to ESP... ({len(ready_b64)} chars)")
+                    artwork_msg = json.dumps({"artwork_b64": ready_b64}) + "\n"
+                    ser.write(artwork_msg.encode("utf-8"))
+                    artwork_sent_url = ready_url
+                    print(f"[ARTWORK SENT] {len(artwork_msg)} bytes")
                     
             except SerialTimeoutException:
                 print("[SERIAL ERROR] Timeout writing to ESP.")
@@ -196,6 +278,10 @@ def system_monitor_loop(interval=2):
                 except Exception:
                     pass
                 ser = None
+        else:
+            # Debug: show if serial is not connected
+            if loop_start % 10 < 1:  # Print every ~10 seconds
+                print("[WARNING] Serial not connected, data not sent to ESP")
 
         socketio.sleep(interval)
 
@@ -771,8 +857,8 @@ if __name__ == "__main__":
     # Prime psutil counters
     prime_psutil()
 
-    # Start background system monitor (0.25s = 4 Hz for real-time feel)
-    socketio.start_background_task(system_monitor_loop, 0.25)
+    # Start background system monitor (1.0s = 1 Hz to match progress bar updates)
+    socketio.start_background_task(system_monitor_loop, 1.0)
 
     print("[SERVER RUNNING] Flask-SocketIO on port 8080...")
     # IMPORTANT: no reloader, single process => only one serial owner

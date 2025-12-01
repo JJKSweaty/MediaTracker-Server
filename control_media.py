@@ -252,11 +252,39 @@ def spotifyVolume(volume_percent):
             print("Error: Could not change volume")
             print(response.text)
 
+# Cache for Spotify progress to avoid too many API calls
+_spotify_cache = {
+    "position": 0,
+    "duration": 0,
+    "is_playing": False,
+    "last_fetch": 0,
+    "last_position_update": 0
+}
+_SPOTIFY_CACHE_TTL = 2.0  # Only call API every 2 seconds
+
 def get_spotify_progress():
     """
-    Get current playback progress from Spotify API.
+    Get current playback progress from Spotify API with caching.
     Returns (position_seconds, duration_seconds, is_playing) or (0, 0, False) on error.
+    Interpolates position between API calls for smooth progress bar.
     """
+    global _spotify_cache
+    now = time.time()
+    
+    # If cached data is fresh enough, interpolate position
+    if now - _spotify_cache["last_fetch"] < _SPOTIFY_CACHE_TTL:
+        # Interpolate position if playing
+        if _spotify_cache["is_playing"]:
+            elapsed = now - _spotify_cache["last_position_update"]
+            interpolated_pos = min(
+                _spotify_cache["position"] + int(elapsed),
+                _spotify_cache["duration"]
+            )
+            return (interpolated_pos, _spotify_cache["duration"], _spotify_cache["is_playing"])
+        else:
+            return (_spotify_cache["position"], _spotify_cache["duration"], _spotify_cache["is_playing"])
+    
+    # Fetch fresh data from API
     try:
         if authorized_req():
             tokens = load_tokens()
@@ -274,10 +302,19 @@ def get_spotify_progress():
                 # Convert to seconds
                 pos_sec = progress_ms // 1000
                 dur_sec = duration_ms // 1000
-                print(f"[SPOTIFY PROGRESS] pos={pos_sec}s dur={dur_sec}s playing={is_playing}")
+                
+                # Update cache
+                _spotify_cache["position"] = pos_sec
+                _spotify_cache["duration"] = dur_sec
+                _spotify_cache["is_playing"] = is_playing
+                _spotify_cache["last_fetch"] = now
+                _spotify_cache["last_position_update"] = now
+                
                 return (pos_sec, dur_sec, is_playing)
             elif response.status_code == 204:
                 # No content - nothing playing
+                _spotify_cache["is_playing"] = False
+                _spotify_cache["last_fetch"] = now
                 return (0, 0, False)
             else:
                 print(f"[SPOTIFY PROGRESS] API returned {response.status_code}")
@@ -285,7 +322,7 @@ def get_spotify_progress():
             print("[SPOTIFY PROGRESS] Not authorized")
     except Exception as e:
         print(f"[SPOTIFY PROGRESS] Error: {e}")
-    return (0, 0, False)
+    return (_spotify_cache["position"], _spotify_cache["duration"], _spotify_cache["is_playing"])
 
 # SPOTIFY SECTION ENDS HERE
 
