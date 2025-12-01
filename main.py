@@ -3,6 +3,7 @@ from flask import Flask, request, jsonify
 from flask_socketio import SocketIO
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
+
 import os
 import base64
 from dotenv import load_dotenv
@@ -10,12 +11,21 @@ import requests
 import json
 import webbrowser
 import urllib.parse
+
+# === TASK MANAGER ADDITIONS ===
+import psutil
+import datetime
+import time
+import serial
+from serial import SerialException, SerialTimeoutException
+# ===============================
+
 load_dotenv()
 pending_command = None
 
-CLIENT_ID = os.getenv("CLIENT_ID")
-CLIENT_SECRET = os.getenv("CLIENT_SECRET")
-REDIRECT_URI = os.getenv("REDIRECT_URI")
+CLIENT_ID = os.getenv("CLIENT_ID", "").strip('"')
+CLIENT_SECRET = os.getenv("CLIENT_SECRET", "").strip('"')
+REDIRECT_URI = os.getenv("REDIRECT_URI", "").strip('"')
 connected_clients = {}
 title_data = ""
 artist_data = ""
@@ -24,30 +34,159 @@ artwork_data = ""
 client_creds = f"{CLIENT_ID}:{CLIENT_SECRET}"
 encoded = base64.b64encode(client_creds.encode()).decode()
 
+# === SERIAL CONFIG FOR ESP ===
+# Set this to the actual COM your ESP shows up as in Device Manager.
+# You can override via .env: SERIAL_PORT=COM4
+SERIAL_PORT = os.getenv("SERIAL_PORT", "COM3")
+SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "115200"))
+ser = None
+SERIAL_DEBUG = os.getenv("SERIAL_DEBUG", "1") in ("1", "true", "True")
+DISABLE_AUTO_SERIAL = os.getenv("DISABLE_AUTO_SERIAL", "0") in ("1", "true", "True")
+# =============================
+
+# Basic validation to help debug Spotify auth issues quickly
+if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
+    print("[ERROR] Missing Spotify credentials. Create a `.env` file in the project root with the following keys:")
+    print("  CLIENT_ID=your_spotify_client_id")
+    print("  CLIENT_SECRET=your_spotify_client_secret")
+    print("  REDIRECT_URI=http://localhost:8080/callback")
+    print("Make sure the Redirect URI exactly matches the value configured in your Spotify developer app.")
+    raise SystemExit(1)
+
+# Print the effective config values for debugging (CLIENT_SECRET is not printed)
+masked_client = CLIENT_ID[:4] + '...' + CLIENT_ID[-4:] if CLIENT_ID else 'None'
+print(f"[CONFIG] CLIENT_ID={masked_client}")
+print(f"[CONFIG] REDIRECT_URI={REDIRECT_URI}")
+print(f"[CONFIG] SERIAL_PORT={SERIAL_PORT} BAUD={SERIAL_BAUD}")
+
+
+# === TASK MANAGER ADDITIONS ===
+def get_system_snapshot():
+    """Return a task-manager style snapshot for the UI and ESP."""
+    data = {}
+
+    # Time info
+    ts = time.time()
+    utc_offset = (datetime.datetime.fromtimestamp(ts) -
+                  datetime.datetime.utcfromtimestamp(ts)).total_seconds()
+    data["utc_offset"] = int(utc_offset)
+
+    now = datetime.datetime.now()
+    data["local_time"] = int(now.timestamp())
+
+    # CPU and memory
+    data["cpu_percent_total"] = psutil.cpu_percent(interval=0.1)
+    mem = psutil.virtual_memory()
+    data["mem_percent"] = mem.percent
+
+    # Battery
+    battery = psutil.sensors_battery()
+    if battery is not None:
+        data["battery_percent"] = battery.percent
+        data["power_plugged"] = bool(battery.power_plugged)
+    else:
+        data["battery_percent"] = None
+        data["power_plugged"] = None
+
+    # Processes: collect CPU usage for each process and pick top 5 by CPU.
+    processes = []
+    for proc in psutil.process_iter(["pid", "name"]):
+        try:
+            cpu_p = proc.cpu_percent(interval=None)
+            name = proc.info.get("name") or ""
+            processes.append((cpu_p, name))
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            continue
+
+    procs_sorted = sorted(processes, key=lambda x: x[0], reverse=True)[:5]
+    data["cpu_top5_process"] = [f"{p[0]:.1f}% {p[1]}" for p in procs_sorted]
+    return data
+
+
+def system_monitor_loop(interval=2):
+    """Background loop that broadcasts system info over Socket.IO and serial."""
+    global ser
+    while True:
+        snapshot = get_system_snapshot()
+
+        # NEW: attach media block from Spotify / metadata globals
+        media = get_media_snapshot()
+        if media is not None:
+            snapshot["media"] = media
+
+        # 1) Emit to web clients via Socket.IO
+        socketio.emit("system_info", snapshot)
+
+        # 2) Send to ESP via serial as newline-terminated JSON
+        if ser is not None:
+            try:
+                line = json.dumps(snapshot) + "\n"
+                if SERIAL_DEBUG:
+                    print(f"[SERIAL OUT] {line.strip()}")
+                ser.write(line.encode("utf-8"))
+            except SerialTimeoutException:
+                print("[SERIAL ERROR] Timeout writing to ESP.")
+            except SerialException as e:
+                print(f"[SERIAL ERROR] {e}")
+                try:
+                    ser.close()
+                except Exception:
+                    pass
+                ser = None
+
+        socketio.sleep(interval)
+
+
+def prime_psutil():
+    """Prime cpu_percent counters so the first reading isn't 0.0."""
+    try:
+        psutil.cpu_percent(interval=None)
+        for proc in psutil.process_iter(['pid', 'name']):
+            try:
+                proc.cpu_percent(interval=None)
+            except Exception:
+                continue
+    except Exception:
+        pass
+# ===============================
+
+
 @app.route("/callback")
 def callback():
-    codes=request.args.get("code")
-    if(codes): 
-     print(f"[CALLBACK] Received code: {codes}")
+    codes = request.args.get("code")
+    if codes:
+        print(f"[CALLBACK] Received code: {codes}")
     else:
         return "Error: No code received"
-    response = requests.post("https://accounts.spotify.com/api/token", headers={"Authorization": "Basic "+encoded}, data={"grant_type":"authorization_code","code":codes,"redirect_uri":REDIRECT_URI})
-    tokens = response.json()
-    with open("tokens.json", "w") as f:
-        json.dump(tokens, f, indent=3)
-    return "Authorization successful. You can close this window."
+    response = requests.post(
+        "https://accounts.spotify.com/api/token",
+        headers={"Authorization": "Basic " + encoded},
+        data={"grant_type": "authorization_code", "code": codes, "redirect_uri": REDIRECT_URI}
+    )
+    # Better error visibility for token exchange
+    if response.ok:
+        tokens = response.json()
+        with open("tokens.json", "w") as f:
+            json.dump(tokens, f, indent=3)
+        print("[CALLBACK] Tokens saved to tokens.json")
+        return "Authorization successful. You can close this window."
+    else:
+        print(f"[CALLBACK ERROR] Status: {response.status_code} Response: {response.text}")
+        return f"Authorization failed: {response.status_code} - check server logs for details.", 500
 
 
 @socketio.event("connect")
 def handle_connect():
     print(f"[CONNECTED] Client connected")
-    connected_clients["client"] = True  
+    connected_clients["client"] = True
     socketio.emit("my_response", {"msg": "Hello from server"})
+
 
 @socketio.on("disconnect")
 def handle_disconnect():
     print(f"[DISCONNECTED] Client disconnected")
     connected_clients.pop("client", None)
+
 
 @socketio.on("sendTitle")
 def receive_title(data):
@@ -55,11 +194,13 @@ def receive_title(data):
     title_data = data
     print(f"[RECEIVED TITLE]: {title_data}")
 
+
 @socketio.on("sendArtist")
 def receive_artist(data):
     global artist_data
     artist_data = data
     print(f"[RECEIVED ARTIST]: {artist_data}")
+
 
 @socketio.on("sendAlbum")
 def receive_album(data):
@@ -67,11 +208,152 @@ def receive_album(data):
     album_data = data
     print(f"[RECEIVED ALBUM]: {album_data}")
 
+
 @socketio.on("sendArtwork")
 def receive_artwork(data):
     global artwork_data
     artwork_data = data
     print(f"[RECEIVED ARTWORK]: {artwork_data}")
+
+
+# === TASK MANAGER ADDITIONS: HTTP + SOCKET ENDPOINTS ===
+@app.route("/system_info", methods=["GET"])
+def system_info():
+    """REST endpoint to get a one-shot system snapshot."""
+    snapshot = get_system_snapshot()
+    return jsonify(snapshot)
+
+
+@socketio.on("request_system_info")
+def handle_request_system_info():
+    """Client can emit 'request_system_info' to get a snapshot."""
+    snapshot = get_system_snapshot()
+    socketio.emit("system_info", snapshot)
+
+
+@app.route("/kill_process", methods=["POST"])
+def kill_process():
+    """
+    Kill a process by pid or by name.
+    Body examples:
+        { "pid": 1234 }
+        { "name": "chrome.exe" }
+    """
+    data = request.json or {}
+    pid = data.get("pid")
+    name = data.get("name")
+
+    if pid is None and not name:
+        return jsonify({"error": "pid or name required"}), 400
+
+    # Kill by PID
+    if pid is not None:
+        try:
+            pid = int(pid)
+            proc = psutil.Process(pid)
+            proc_name = proc.name()
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+                status = "terminated"
+            except psutil.TimeoutExpired:
+                proc.kill()
+                status = "killed"
+            return jsonify({"status": status, "pid": pid, "name": proc_name})
+        except psutil.NoSuchProcess:
+            return jsonify({"error": "process not found"}), 404
+        except psutil.AccessDenied:
+            return jsonify({"error": "access denied"}), 403
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    # Kill by name (all matches, except this server process)
+    killed = []
+    try:
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                if not proc.info["name"]:
+                    continue
+                if proc.info["name"].lower() == name.lower():
+                    if proc.pid == os.getpid():
+                        continue  # do not kill this server
+                    proc.terminate()
+                    killed.append(proc.info["pid"])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        if not killed:
+            return jsonify({"status": "no_matching_process"}), 404
+
+        return jsonify({"status": "terminated_by_name", "name": name, "pids": killed})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@socketio.on("kill_process")
+def handle_kill_process_socket(data):
+    """
+    Socket.IO version.
+    Client emits:
+        socket.emit("kill_process", { pid: 1234 })
+    or:
+        socket.emit("kill_process", { name: "chrome.exe" })
+    """
+    data = data or {}
+    pid = data.get("pid")
+    name = data.get("name")
+
+    with app.test_request_context():
+        if pid is None and not name:
+            socketio.emit("kill_process_result", {"error": "pid or name required"})
+            return
+
+        if pid is not None:
+            try:
+                pid = int(pid)
+                proc = psutil.Process(pid)
+                proc_name = proc.name()
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                    status = "terminated"
+                except psutil.TimeoutExpired:
+                    proc.kill()
+                    status = "killed"
+                socketio.emit("kill_process_result", {"status": status, "pid": pid, "name": proc_name})
+                return
+            except psutil.NoSuchProcess:
+                socketio.emit("kill_process_result", {"error": "process not found"})
+                return
+            except psutil.AccessDenied:
+                socketio.emit("kill_process_result", {"error": "access denied"})
+                return
+            except Exception as e:
+                socketio.emit("kill_process_result", {"error": str(e)})
+                return
+
+        killed = []
+        try:
+            for proc in psutil.process_iter(["pid", "name"]):
+                try:
+                    if not proc.info["name"]:
+                        continue
+                    if proc.info["name"].lower() == name.lower():
+                        if proc.pid == os.getpid():
+                            continue
+                        proc.terminate()
+                        killed.append(proc.info["pid"])
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+
+            if not killed:
+                socketio.emit("kill_process_result", {"status": "no_matching_process"})
+            else:
+                socketio.emit("kill_process_result", {"status": "terminated_by_name", "name": name, "pids": killed})
+        except Exception as e:
+            socketio.emit("kill_process_result", {"error": str(e)})
+# =======================================================
+
 
 @app.route("/send_command", methods=["POST"])
 def set_command():
@@ -84,6 +366,7 @@ def set_command():
         return jsonify({"status": "command set", "command": command})
     return jsonify({"error": "invalid command"}), 400
 
+
 @app.route("/get_command", methods=["GET"])
 def get_command():
     global pending_command
@@ -92,6 +375,8 @@ def get_command():
         pending_command = None  # Clear it after sending
         return jsonify({"command": cmd})
     return jsonify({"command": None})
+
+
 def get_metadata():
     return {
         "title": title_data,
@@ -99,6 +384,33 @@ def get_metadata():
         "album": album_data,
         "artwork": artwork_data
     }
+def get_media_snapshot():
+    """
+    Build a media snapshot from the current Spotify metadata globals.
+    This will be embedded in the JSON sent over serial under the 'media' key.
+    """
+    global title_data, artist_data, album_data, artwork_data
+
+    # If nothing is set yet, skip media entirely
+    if not title_data and not artist_data and not album_data and not artwork_data:
+        return None
+
+    media = {
+        "title": title_data or "",
+        "artist": artist_data or "",
+        "album": album_data or "",
+        # For now, if you don't have real timing, keep 0 / 0.
+        # Later you can wire these up from getPlayerInfo().
+        "position_seconds": 0,
+        "duration_seconds": 0,
+    }
+
+    # If your frontend is already sending base64 PNG, just forward it.
+    # If it's a URL, the ESP's base64 decode will fail but text UI still works.
+    if artwork_data:
+        media["artwork_b64"] = artwork_data
+
+    return media
 
 def handle_user_input():
     from control_media import (
@@ -117,7 +429,6 @@ def handle_user_input():
         send_play,
         send_pause,
         print_stored_metadata
-
     )
     print("\n[ CONTROL PANEL]")
     print("Type:")
@@ -166,7 +477,32 @@ def handle_user_input():
         except Exception as e:
             print(f"[ERROR] {str(e)}")
 
+
 if __name__ == "__main__":
+    # CLI control panel
     threading.Thread(target=handle_user_input, daemon=True).start()
+
+    # === OPEN SERIAL PORT TO ESP ===
+    if DISABLE_AUTO_SERIAL:
+        print("[SERIAL] Auto-open disabled via DISABLE_AUTO_SERIAL")
+        ser = None
+    else:
+        try:
+            print(f"[SERIAL] Opening {SERIAL_PORT} at {SERIAL_BAUD}...")
+            ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+            print("[SERIAL] Connected to ESP.")
+        except Exception as e:
+            print(f"[SERIAL ERROR] Could not open port {SERIAL_PORT}: {e}")
+            ser = None
+    # =================================
+
+    # Prime psutil counters
+    prime_psutil()
+
+    # Start background system monitor
+    socketio.start_background_task(system_monitor_loop, 2)
+
     print("[SERVER RUNNING] Flask-SocketIO on port 8080...")
-    socketio.run(app, host="0.0.0.0", port=8080, debug=True)
+    # IMPORTANT: no reloader, single process => only one serial owner
+    socketio.run(app, host="0.0.0.0", port=8080, debug=False, use_reloader=False)
+  
