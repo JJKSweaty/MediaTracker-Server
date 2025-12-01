@@ -89,9 +89,33 @@ def Auth():
 def get_auth_url():
     """Return the Spotify Authorization URL without opening a browser; useful for server endpoints.
     Ensures scope and redirect URI are URL encoded properly.
+    
+    Scopes included:
+    - Playback: user-read-playback-state, user-modify-playback-state, user-read-currently-playing
+    - Playlists: playlist-read-private, playlist-read-collaborative, playlist-modify-public, playlist-modify-private
+    - Library: user-library-read, user-library-modify
+    - History: user-read-recently-played, user-top-read
     """
     encoded_redirect_uri = urllib.parse.quote(REDIRECT_URI, safe='')
-    scope = "user-read-playback-state user-modify-playback-state"
+    # Extended scopes for full playlist/queue functionality
+    scopes = [
+        # Playback control
+        "user-read-playback-state",
+        "user-modify-playback-state",
+        "user-read-currently-playing",
+        # Playlists
+        "playlist-read-private",
+        "playlist-read-collaborative",
+        "playlist-modify-public",
+        "playlist-modify-private",
+        # Library (likes)
+        "user-library-read",
+        "user-library-modify",
+        # History
+        "user-read-recently-played",
+        "user-top-read",
+    ]
+    scope = " ".join(scopes)
     scope_param = urllib.parse.quote_plus(scope)
     # Add show_dialog=true so Spotify forces user login and ensures refresh code is returned.
     auth_url = (

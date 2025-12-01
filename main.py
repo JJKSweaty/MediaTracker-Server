@@ -19,8 +19,11 @@ import datetime
 import time
 import serial
 from serial import SerialException, SerialTimeoutException
-from control_media import spotifyPlay, spotifyPause, spotifyNext, spotifyPrevious, media_play_pause, media_next, media_previous, get_spotify_progress
+from control_media import spotifyPlay, spotifyPause, spotifyNext, spotifyPrevious, media_play_pause, media_next, media_previous, get_spotify_progress, is_app_playing
 from image_utils import get_artwork_rgb565_base64, get_artwork_png_b64, clear_cache as clear_image_cache
+
+# Spotify Queue Manager for playlist/queue features
+from spotify_queue import get_queue_manager, SpotifyQueueManager
 
 # GPU monitoring (optional - works with NVIDIA GPUs)
 try:
@@ -359,6 +362,163 @@ def system_monitor_loop(interval=2.0):
         socketio.sleep(sleep_time)
 
 
+# ========== QUEUE/PLAYLIST COMMAND HANDLERS ==========
+
+def _handle_queue_action(cmd: dict):
+    """
+    Handle queue actions from ESP32.
+    Commands:
+      - {"type": "queue_action", "action": "play_now", "track_id": "spotify:track:XXX"}
+      - {"type": "queue_action", "action": "remove", "track_id": "spotify:track:XXX", "playlist_id": "..."}
+      - {"type": "queue_action", "action": "add_to_queue", "track_id": "spotify:track:XXX"}
+      - {"type": "queue_action", "action": "reorder", "playlist_id": "...", "from_index": 0, "to_index": 5}
+    """
+    action = cmd.get("action", "")
+    track_id = cmd.get("track_id", "")
+    
+    try:
+        queue_mgr = get_queue_manager()
+        
+        if action == "play_now":
+            if not track_id:
+                print("[QUEUE CMD] play_now missing track_id")
+                return
+            # Check if it's a local track (can't play via API)
+            if ":local:" in track_id:
+                print(f"[QUEUE CMD] Cannot play local track via API: {track_id}")
+                return
+            success = queue_mgr.play_track(track_id)
+            if SERIAL_DEBUG:
+                print(f"[QUEUE CMD] play_now {track_id}: {'OK' if success else 'FAIL'}")
+        
+        elif action == "add_to_queue":
+            if not track_id:
+                print("[QUEUE CMD] add_to_queue missing track_id")
+                return
+            if ":local:" in track_id:
+                print(f"[QUEUE CMD] Cannot queue local track: {track_id}")
+                return
+            success = queue_mgr.add_to_queue(track_id)
+            if SERIAL_DEBUG:
+                print(f"[QUEUE CMD] add_to_queue {track_id}: {'OK' if success else 'FAIL'}")
+        
+        elif action == "remove":
+            playlist_id = cmd.get("playlist_id", "")
+            snapshot_id = cmd.get("snapshot_id")
+            if not track_id or not playlist_id:
+                print("[QUEUE CMD] remove missing track_id or playlist_id")
+                return
+            new_snap = queue_mgr.remove_track_from_playlist(playlist_id, track_id, snapshot_id)
+            if SERIAL_DEBUG:
+                print(f"[QUEUE CMD] remove {track_id} from {playlist_id}: {'OK' if new_snap else 'FAIL'}")
+        
+        elif action == "reorder":
+            playlist_id = cmd.get("playlist_id", "")
+            from_idx = cmd.get("from_index", 0)
+            to_idx = cmd.get("to_index", 0)
+            snapshot_id = cmd.get("snapshot_id")
+            if not playlist_id:
+                print("[QUEUE CMD] reorder missing playlist_id")
+                return
+            new_snap = queue_mgr.reorder_playlist_tracks(playlist_id, from_idx, to_idx, 1, snapshot_id)
+            if SERIAL_DEBUG:
+                print(f"[QUEUE CMD] reorder {playlist_id} {from_idx}->{to_idx}: {'OK' if new_snap else 'FAIL'}")
+        
+        else:
+            print(f"[QUEUE CMD] Unknown action: {action}")
+    
+    except Exception as e:
+        print(f"[QUEUE CMD] Error: {e}")
+
+
+def _handle_playlist_action(cmd: dict):
+    """
+    Handle playlist actions from ESP32.
+    Commands:
+      - {"type": "playlist_action", "action": "set_active", "playlist_id": "..."}
+      - {"type": "playlist_action", "action": "follow", "playlist_id": "..."}
+      - {"type": "playlist_action", "action": "unfollow", "playlist_id": "..."}
+      - {"type": "playlist_action", "action": "get_playlists"}
+    """
+    action = cmd.get("action", "")
+    playlist_id = cmd.get("playlist_id", "")
+    
+    try:
+        queue_mgr = get_queue_manager()
+        
+        if action == "set_active":
+            if not playlist_id:
+                print("[PLAYLIST CMD] set_active missing playlist_id")
+                return
+            success = queue_mgr.set_active_playlist(playlist_id)
+            if SERIAL_DEBUG:
+                print(f"[PLAYLIST CMD] set_active {playlist_id}: {'OK' if success else 'FAIL'}")
+        
+        elif action == "follow":
+            if not playlist_id:
+                print("[PLAYLIST CMD] follow missing playlist_id")
+                return
+            success = queue_mgr.follow_playlist(playlist_id)
+            if SERIAL_DEBUG:
+                print(f"[PLAYLIST CMD] follow {playlist_id}: {'OK' if success else 'FAIL'}")
+        
+        elif action == "unfollow":
+            if not playlist_id:
+                print("[PLAYLIST CMD] unfollow missing playlist_id")
+                return
+            success = queue_mgr.unfollow_playlist(playlist_id)
+            if SERIAL_DEBUG:
+                print(f"[PLAYLIST CMD] unfollow {playlist_id}: {'OK' if success else 'FAIL'}")
+        
+        elif action == "get_playlists":
+            playlists = queue_mgr.get_user_playlists(limit=10)
+            # Send playlists list back to ESP (could use a separate message)
+            # For now just log
+            if SERIAL_DEBUG:
+                print(f"[PLAYLIST CMD] get_playlists: {len(playlists)} playlists")
+            # TODO: Send playlist list to ESP via serial
+        
+        else:
+            print(f"[PLAYLIST CMD] Unknown action: {action}")
+    
+    except Exception as e:
+        print(f"[PLAYLIST CMD] Error: {e}")
+
+
+def _handle_like_track(cmd: dict):
+    """
+    Handle like/unlike track actions from ESP32.
+    Commands:
+      - {"type": "like_track", "action": "like", "track_id": "spotify:track:XXX"}
+      - {"type": "like_track", "action": "unlike", "track_id": "spotify:track:XXX"}
+    """
+    action = cmd.get("action", "like")
+    track_id = cmd.get("track_id", "")
+    
+    if not track_id:
+        print("[LIKE CMD] Missing track_id")
+        return
+    
+    try:
+        queue_mgr = get_queue_manager()
+        
+        if action == "like":
+            success = queue_mgr.save_track(track_id)
+            if SERIAL_DEBUG:
+                print(f"[LIKE CMD] like {track_id}: {'OK' if success else 'FAIL'}")
+        elif action == "unlike":
+            success = queue_mgr.remove_saved_track(track_id)
+            if SERIAL_DEBUG:
+                print(f"[LIKE CMD] unlike {track_id}: {'OK' if success else 'FAIL'}")
+        else:
+            print(f"[LIKE CMD] Unknown action: {action}")
+    
+    except Exception as e:
+        print(f"[LIKE CMD] Error: {e}")
+
+
+# =======================================================
+
 def serial_command_loop():
         """Background loop that reads commands from the ESP via serial and acts on them."""
         global ser
@@ -446,6 +606,16 @@ def serial_command_loop():
                         except Exception as e:
                             if SERIAL_DEBUG:
                                 print(f"[SERIAL CMD] Prev error: {e}")
+                    
+                    # ========== QUEUE/PLAYLIST COMMANDS ==========
+                    elif typ == "queue_action":
+                        _handle_queue_action(cmd)
+                    elif typ == "playlist_action":
+                        _handle_playlist_action(cmd)
+                    elif typ == "like_track":
+                        _handle_like_track(cmd)
+                    # ==============================================
+                    
                     else:
                         if SERIAL_DEBUG:
                             print(f"[SERIAL CMD] Unknown cmd: {cmd}")
@@ -897,36 +1067,138 @@ _last_seen_artwork_url = None
 _last_seen_artwork_ts = 0
 _ARTWORK_TTL = float(os.getenv("ARTWORK_TTL_SECONDS", "5"))
 
+# Cache for Spotify playback state (used to determine priority)
+_spotify_playback_cache = {
+    "is_active": False,
+    "last_check": 0.0,
+    "data": None
+}
+_SPOTIFY_PLAYBACK_CHECK_TTL = 2.0  # seconds
+
+def _check_spotify_active() -> tuple:
+    """
+    Check if Spotify is actively playing using the API.
+    Returns (is_active, playback_data) tuple.
+    Cached to avoid excessive API calls.
+    """
+    global _spotify_playback_cache
+    now = time.time()
+    
+    # Return cached result if fresh
+    if (now - _spotify_playback_cache["last_check"]) < _SPOTIFY_PLAYBACK_CHECK_TTL:
+        return (_spotify_playback_cache["is_active"], _spotify_playback_cache["data"])
+    
+    # Also check if Spotify.exe is running with audio
+    spotify_audio_active = False
+    try:
+        spotify_audio_active = is_app_playing("spotify.exe")
+    except Exception:
+        pass
+    
+    if not spotify_audio_active:
+        _spotify_playback_cache["is_active"] = False
+        _spotify_playback_cache["data"] = None
+        _spotify_playback_cache["last_check"] = now
+        return (False, None)
+    
+    # Spotify app is playing audio - get playback state from API
+    try:
+        from control_media import load_tokens, authorized_req
+        if authorized_req():
+            tokens = load_tokens()
+            access_token = tokens.get("access_token")
+            resp = requests.get(
+                "https://api.spotify.com/v1/me/player",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=2
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                is_playing = data.get("is_playing", False)
+                _spotify_playback_cache["is_active"] = is_playing
+                _spotify_playback_cache["data"] = data if is_playing else None
+                _spotify_playback_cache["last_check"] = now
+                return (is_playing, data if is_playing else None)
+            elif resp.status_code == 204:
+                # No active device
+                _spotify_playback_cache["is_active"] = False
+                _spotify_playback_cache["data"] = None
+                _spotify_playback_cache["last_check"] = now
+                return (False, None)
+    except Exception as e:
+        if SERIAL_DEBUG:
+            print(f"[SPOTIFY CHECK] Error: {e}")
+    
+    _spotify_playback_cache["last_check"] = now
+    return (_spotify_playback_cache["is_active"], _spotify_playback_cache["data"])
+
+
 def get_media_snapshot():
     """
     Build a media snapshot from current metadata.
+    
+    PRIORITY: Spotify takes precedence over browser media (YouTube, etc.) when both are playing.
     Uses Spotify API for progress if Spotify is active, otherwise uses browser extension data.
     """
     global title_data, artist_data, album_data, artwork_data
     global position_data, duration_data, is_playing_data, media_source
 
+    # Check if Spotify is actively playing - it takes priority
+    spotify_active, spotify_data = _check_spotify_active()
+    
+    if spotify_active and spotify_data:
+        # === SPOTIFY IS PLAYING - USE SPOTIFY DATA ===
+        item = spotify_data.get("item", {})
+        if item:
+            # Extract Spotify metadata
+            sp_title = item.get("name", "")
+            sp_artists = item.get("artists", [])
+            sp_artist = ", ".join(a.get("name", "") for a in sp_artists[:2]) if sp_artists else ""
+            sp_album = item.get("album", {}).get("name", "")
+            sp_duration = item.get("duration_ms", 0) // 1000
+            sp_position = spotify_data.get("progress_ms", 0) // 1000
+            sp_playing = spotify_data.get("is_playing", False)
+            
+            # Get artwork
+            sp_images = item.get("album", {}).get("images", [])
+            sp_artwork = sp_images[0].get("url") if sp_images else None
+            
+            media = {
+                "title": sp_title,
+                "artist": sp_artist,
+                "album": sp_album,
+                "position_seconds": sp_position,
+                "duration_seconds": sp_duration,
+                "is_playing": sp_playing,
+                "source": "spotify",
+                "has_artwork": sp_artwork is not None,
+                "artwork_url": sp_artwork,
+            }
+            
+            # Add queue data for Spotify (limit to 5 items to save ESP32 memory)
+            try:
+                queue_mgr = get_queue_manager()
+                queue_data = queue_mgr.get_queue_for_esp(max_items=5)
+                if queue_data.get("queue"):
+                    media["queue"] = queue_data["queue"]
+                if queue_data.get("playlist"):
+                    media["playlist"] = queue_data["playlist"]
+            except Exception as e:
+                if SERIAL_DEBUG:
+                    print(f"[QUEUE] Error getting queue: {e}")
+            
+            return media
+    
+    # === FALLBACK TO BROWSER EXTENSION DATA (YouTube, etc.) ===
+    
     # If nothing is set yet, skip media entirely
     if not title_data and not artist_data and not album_data and not artwork_data:
         return None
 
-    # Determine if we should use Spotify API or browser extension data
-    # Use Spotify API only if media source is spotify or if we don't have browser progress data
-    use_spotify_api = (media_source == "spotify" or 
-                       ("spotify" in artist_data.lower() if artist_data else False))
-    
-    if use_spotify_api:
-        # Try Spotify API for progress
-        position_sec, duration_sec, is_playing = get_spotify_progress()
-        # If Spotify returns no data, fall back to browser data
-        if duration_sec == 0 and duration_data > 0:
-            position_sec = position_data
-            duration_sec = duration_data
-            is_playing = is_playing_data
-    else:
-        # Use browser extension data (YouTube, etc.)
-        position_sec = position_data
-        duration_sec = duration_data
-        is_playing = is_playing_data
+    # Use browser extension data
+    position_sec = position_data
+    duration_sec = duration_data
+    is_playing = is_playing_data
 
     media = {
         "title": title_data or "",
@@ -935,6 +1207,7 @@ def get_media_snapshot():
         "position_seconds": position_sec,
         "duration_seconds": duration_sec,
         "is_playing": is_playing,
+        "source": media_source or "browser",
     }
 
     # Extract artwork URL - artwork_data can be a URL string or {"src": url} object
