@@ -5,6 +5,7 @@ app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 import os
+import queue
 import base64
 from dotenv import load_dotenv
 import requests
@@ -55,6 +56,13 @@ encoded = base64.b64encode(client_creds.encode()).decode()
 SERIAL_PORT = os.getenv("SERIAL_PORT", "COM3")
 SERIAL_BAUD = int(os.getenv("SERIAL_BAUD", "115200"))
 ser = None
+_serial_queue = queue.Queue()
+_serial_priority_queue = queue.Queue(maxsize=2)  # artwork and other priority messages
+SERIAL_MAX_QUEUE = int(os.getenv("SERIAL_MAX_QUEUE", "8"))
+SERIAL_MIN_INTERVAL = float(os.getenv("SERIAL_MIN_INTERVAL", "0.1"))  # min interval between serial snapshots (seconds)
+_last_serial_sent_time = 0.0
+_last_sent_snapshot_fingerprint = None
+SERIAL_MAX_QUEUE = int(os.getenv("SERIAL_MAX_QUEUE", "8"))
 SERIAL_DEBUG = os.getenv("SERIAL_DEBUG", "1") in ("1", "true", "True")
 DISABLE_AUTO_SERIAL = os.getenv("DISABLE_AUTO_SERIAL", "0") in ("1", "true", "True")
 # =============================
@@ -158,9 +166,24 @@ def get_system_snapshot():
         procs_sorted = _proc_cache["data"]
 
     # Provide both a backward-compatible `cpu_top5_process` (string list) and a richer 'proc_top5'
-    data["cpu_top5_process"] = [f"{p[0]:.1f}% {p[2]}" for p in procs_sorted]
-    # Rich object list for the ESP to parse PID + mem% + name
-    data["proc_top5"] = [{"pid": p[1], "mem": round(p[0], 1), "name": p[2]} for p in procs_sorted]
+    # Create display-friendly names (strip .exe and paths)
+    cleaned = []
+    for p in procs_sorted:
+        mem_p, pid, name = p
+        name_str = name or ""
+        # If name is a path, use basename
+        try:
+            name_str = os.path.basename(name_str)
+        except Exception:
+            pass
+        display_name = name_str
+        if display_name.lower().endswith(".exe"):
+            display_name = display_name[:-4]
+        cleaned.append((mem_p, pid, name_str, display_name))
+
+    data["cpu_top5_process"] = [f"{p[0]:.1f}% {p[3]}" for p in cleaned]
+    # Rich object list for the ESP to parse PID + mem% + name + display_name
+    data["proc_top5"] = [{"pid": p[1], "mem": round(p[0], 1), "name": p[2], "display_name": p[3]} for p in cleaned]
     return data
 
 
@@ -213,14 +236,17 @@ _artwork_thread = threading.Thread(target=artwork_fetch_worker, daemon=True)
 _artwork_thread.start()
 
 
-def system_monitor_loop(interval=2):
-    """Background loop that broadcasts system info over Socket.IO and serial."""
-    global ser, _artwork_state
-    last_artwork_url = None
-    artwork_sent_url = None
+def system_monitor_loop(interval=2.0):
+    """Background loop that broadcasts system info over Socket.IO and serial.
+    The loop is scheduled using time.monotonic to maintain regular intervals and
+    avoid jitter from blocking calls. Serial writes are enqueued to `_serial_queue`.
+    """
+    global ser, _artwork_state, _last_artwork_url, _last_sent_snapshot_fingerprint, _last_serial_sent_time
     
+    interval = float(interval)
+    next_time = time.monotonic()
     while True:
-        loop_start = time.time()
+        loop_start = time.monotonic()
         
         snapshot = get_system_snapshot()
 
@@ -230,13 +256,12 @@ def system_monitor_loop(interval=2):
         
         if media is not None:
             artwork_url = media.pop("artwork_url", None)
-            
+
             # Request artwork fetch in background (non-blocking)
-            if artwork_url and artwork_url != last_artwork_url:
+            if artwork_url and artwork_url != _last_artwork_url:
                 with _artwork_lock:
-                    if not _artwork_state["fetching"]:
+                    if not _artwork_state.get("fetching", False):
                         _artwork_state["pending_url"] = artwork_url
-                        last_artwork_url = artwork_url
                         if SERIAL_DEBUG:
                             print(f"[ARTWORK] Queued for fetch: {artwork_url[:60]}...")
             
@@ -250,25 +275,70 @@ def system_monitor_loop(interval=2):
             try:
                 line = json.dumps(snapshot) + "\n"
                 line_bytes = line.encode("utf-8")
-                
+
                 if SERIAL_DEBUG:
-                    loop_time = (time.time() - loop_start) * 1000
+                    loop_time = (time.monotonic() - loop_start) * 1000
                     print(f"[LOOP] {loop_time:.0f}ms, JSON size: {len(line_bytes)} bytes")
-                
-                ser.write(line_bytes)
-                
+                    # Warn if loop took unusually long
+                    if loop_time > max(200, interval * 1000 * 5):
+                        print(f"[LOOP WARNING] High jitter: {loop_time:.0f}ms")
+
+                # Use background writer to avoid blocking the monitoring loop
+                now_ts = time.monotonic()
+                # Create a compact fingerprint of the snapshot to decide if we should send it
+                try:
+                    fp_source = json.dumps({
+                        "cpu": snapshot.get("cpu_percent_total"),
+                        "mem": snapshot.get("mem_percent"),
+                        "media": snapshot.get("media"),
+                        "time": snapshot.get("local_time")
+                    }, sort_keys=True)
+                except Exception:
+                    fp_source = ""
+                fingerprint = str(hash(fp_source))
+
+                # If fingerprint hasn't changed and we recently sent, skip to reduce traffic
+                should_send_snapshot = True
+                if _last_sent_snapshot_fingerprint == fingerprint and (now_ts - _last_serial_sent_time) < SERIAL_MIN_INTERVAL:
+                    should_send_snapshot = False
+
+                if should_send_snapshot:
+                    try:
+                        if _serial_queue.qsize() >= SERIAL_MAX_QUEUE:
+                            # Drop older message to make space and keep latest
+                            try:
+                                _serial_queue.get_nowait()
+                                _serial_queue.task_done()
+                            except Exception:
+                                pass
+                        _serial_queue.put({"type": "snapshot", "payload": line_bytes}, block=False)
+                        _last_sent_snapshot_fingerprint = fingerprint
+                        _last_serial_sent_time = now_ts
+                    except Exception as e:
+                        if SERIAL_DEBUG:
+                            print(f"[SERIAL WRITER] Queue put failed: {e}")
+
                 # Check if artwork is ready to send
                 with _artwork_lock:
                     ready_b64 = _artwork_state["ready_b64"]
                     ready_url = _artwork_state["ready_url"]
-                
-                if ready_b64 and ready_url and ready_url != artwork_sent_url:
-                    print(f"[ARTWORK] Sending to ESP... ({len(ready_b64)} chars)")
+
+                if ready_b64 and ready_url and ready_url != _last_artwork_url:
+                    print(f"[ARTWORK] Queuing to ESP... ({len(ready_b64)} chars) url={ready_url}")
                     artwork_msg = json.dumps({"artwork_b64": ready_b64}) + "\n"
-                    ser.write(artwork_msg.encode("utf-8"))
-                    artwork_sent_url = ready_url
-                    print(f"[ARTWORK SENT] {len(artwork_msg)} bytes")
-                    
+                    msg_bytes = artwork_msg.encode("utf-8")
+                    try:
+                        # If priority queue is full, remove older artwork to make room
+                        if _serial_priority_queue.full():
+                            try:
+                                _serial_priority_queue.get_nowait()
+                                _serial_priority_queue.task_done()
+                            except Exception:
+                                pass
+                        _serial_priority_queue.put({"type": "artwork", "payload": msg_bytes, "url": ready_url}, block=False)
+                    except Exception as e:
+                        if SERIAL_DEBUG:
+                            print(f"[SERIAL WRITER] Artwork queue put failed: {e}")
             except SerialTimeoutException:
                 print("[SERIAL ERROR] Timeout writing to ESP.")
             except SerialException as e:
@@ -283,7 +353,10 @@ def system_monitor_loop(interval=2):
             if loop_start % 10 < 1:  # Print every ~10 seconds
                 print("[WARNING] Serial not connected, data not sent to ESP")
 
-        socketio.sleep(interval)
+        # Precise periodic scheduling
+        next_time += interval
+        sleep_time = max(0, next_time - time.monotonic())
+        socketio.sleep(sleep_time)
 
 
 def serial_command_loop():
@@ -337,6 +410,12 @@ def serial_command_loop():
                         try:
                             # Use keyboard media key - works with any player
                             media_play_pause()
+                            # Also emit a socketio command to browser extension as a fallback
+                            try:
+                                socketio.emit("command", {"command": "play"})
+                            except Exception as e:
+                                if SERIAL_DEBUG:
+                                    print(f"[SERIAL CMD] socketio emit play failed: {e}")
                         except Exception as e:
                             if SERIAL_DEBUG:
                                 print(f"[SERIAL CMD] Play error: {e}")
@@ -344,6 +423,12 @@ def serial_command_loop():
                         try:
                             # Use keyboard media key - works with any player
                             media_play_pause()
+                            # Also emit a socketio command to browser extension as a fallback
+                            try:
+                                socketio.emit("command", {"command": "pause"})
+                            except Exception as e:
+                                if SERIAL_DEBUG:
+                                    print(f"[SERIAL CMD] socketio emit pause failed: {e}")
                         except Exception as e:
                             if SERIAL_DEBUG:
                                 print(f"[SERIAL CMD] Pause error: {e}")
@@ -369,6 +454,69 @@ def serial_command_loop():
                 if SERIAL_DEBUG:
                     print(f"[SERIAL CMD] Reader exception: {e}")
             time.sleep(0.05)
+
+
+def _serial_writer_loop():
+    global ser
+    global _last_artwork_url
+    last_print_qsize = -1
+    last_print_time = 0
+    while True:
+        try:
+            # Prioritize artwork messages
+            try:
+                priority = _serial_priority_queue.get_nowait()
+                if priority is not None:
+                    dat = priority
+                    if ser is not None and dat is not None:
+                        try:
+                            ser.write(dat["payload"])
+                            # Once artwork message is sent, update last artwork url so we don't resend
+                            try:
+                                _last_artwork_url = dat.get("url")
+                            except Exception:
+                                pass
+                        except Exception as e:
+                            if SERIAL_DEBUG:
+                                print(f"[SERIAL WRITER] Priority write error: {e}")
+                    _serial_priority_queue.task_done()
+                    # go to top of loop to check for more priority items
+                    continue
+            except Exception:
+                pass
+
+            data = _serial_queue.get()
+            if ser is not None and data is not None:
+                try:
+                    if isinstance(data, dict) and data.get("payload"):
+                        ser.write(data["payload"])
+                    else:
+                        ser.write(data)
+                except Exception as e:
+                    if SERIAL_DEBUG:
+                        print(f"[SERIAL WRITER] Write error: {e}")
+            _serial_queue.task_done()
+        except Exception as e:
+            if SERIAL_DEBUG:
+                print(f"[SERIAL WRITER] Exception: {e}")
+        # Debug: print queue size occasionally
+        try:
+            if SERIAL_DEBUG and _serial_queue.qsize() > 0:
+                print(f"[SERIAL WRITER] Queue size: {_serial_queue.qsize()}")
+        except Exception:
+            pass
+        # Small sleep to avoid busy loop
+        time.sleep(0.001)
+        # Print queue size occasionally if it changes or every 2 seconds
+        try:
+            qsize = _serial_queue.qsize()
+            now_ts = time.time()
+            if SERIAL_DEBUG and (qsize != last_print_qsize or (now_ts - last_print_time) > 2):
+                print(f"[SERIAL WRITER] Queue size: {qsize}")
+                last_print_qsize = qsize
+                last_print_time = now_ts
+        except Exception:
+            pass
 
 
 def prime_psutil():
@@ -400,9 +548,15 @@ def callback():
     # Better error visibility for token exchange
     if response.ok:
         tokens = response.json()
+        # Add obtained_at timestamp to help token validation/refresh logic
+        try:
+            tokens["obtained_at"] = int(time.time())
+        except Exception:
+            pass
         with open("tokens.json", "w") as f:
             json.dump(tokens, f, indent=3)
         print("[CALLBACK] Tokens saved to tokens.json")
+        print(f"[CALLBACK] REDIRECT_URI used: {REDIRECT_URI}")
         return "Authorization successful. You can close this window."
     else:
         print(f"[CALLBACK ERROR] Status: {response.status_code} Response: {response.text}")
@@ -655,6 +809,81 @@ def get_command():
     return jsonify({"command": None})
 
 
+@app.route("/trigger_media", methods=["POST"])  # quick local test endpoint
+def trigger_media():
+    data = request.json or {}
+    cmd = data.get("command")
+    if cmd not in ("play", "pause", "next", "previous"):
+        return jsonify({"error": "invalid command"}), 400
+    # Try to run the media action locally
+    if cmd in ("play", "pause"):
+        media_play_pause()
+    elif cmd == "next":
+        media_next()
+    elif cmd == "previous":
+        media_previous()
+    # Also emit via socketio to connected extension clients
+    try:
+        socketio.emit("command", {"command": cmd})
+    except Exception as e:
+        print(f"[TRIGGER MEDIA] socketio emit failed: {e}")
+    return jsonify({"status": "triggered", "command": cmd})
+
+
+@app.route("/auth", methods=["GET"])  # helper to return the auth URL (useful for manual copy/paste)
+def auth_url():
+    from control_media import get_auth_url
+    try:
+        url = get_auth_url()
+    except Exception as e:
+        print(f"[AUTH] Error constructing auth URL: {e}")
+        return jsonify({"error": "failed to construct auth url", "details": str(e)}), 500
+    print(f"[AUTH] Returning auth URL: {url}")
+    return jsonify({"auth_url": url, "redirect_uri": REDIRECT_URI})
+
+
+@app.route("/authpage", methods=["GET"])  # small HTML auth page with clickable link for convenience
+def auth_page():
+    from control_media import get_auth_url
+    try:
+        url = get_auth_url()
+    except Exception as e:
+        return f"<p>Error constructing auth URL: {e}</p>", 500
+    html = f"""
+    <!doctype html>
+    <html>
+        <head>
+            <title>Spotify Auth</title>
+        </head>
+        <body>
+            <h2>Spotify Authorization</h2>
+            <p>Click the link below to log into Spotify and authorize the app:</p>
+            <p><a href=\"{url}\" target=\"_blank\">Click here to authorize</a></p>
+            <p>Redirect URI: <code>{REDIRECT_URI}</code></p>
+        </body>
+    </html>
+    """
+    return html
+
+
+@app.route("/auth_status", methods=["GET"])  # simple status that shows auth config and token state
+def auth_status():
+    status = {"client_id": None, "redirect_uri": REDIRECT_URI, "tokens": False}
+    if CLIENT_ID:
+        status["client_id"] = CLIENT_ID[:4] + "..." + CLIENT_ID[-4:]
+    if os.path.exists("tokens.json"):
+        try:
+            with open("tokens.json", "r") as f:
+                t = json.load(f)
+            status["tokens"] = True
+            status["token_expires_in"] = t.get("expires_in")
+            status["token_obtained_at"] = t.get("obtained_at")
+        except Exception as e:
+            status["tokens"] = False
+            status["token_error"] = str(e)
+    return jsonify(status)
+
+
 def get_metadata():
     return {
         "title": title_data,
@@ -664,6 +893,9 @@ def get_metadata():
     }
 # Track last sent artwork URL to avoid redundant sends
 _last_artwork_url = None
+_last_seen_artwork_url = None
+_last_seen_artwork_ts = 0
+_ARTWORK_TTL = float(os.getenv("ARTWORK_TTL_SECONDS", "5"))
 
 def get_media_snapshot():
     """
@@ -712,6 +944,18 @@ def get_media_snapshot():
             artwork_url = artwork_data["src"]
         elif isinstance(artwork_data, str) and artwork_data.startswith("http"):
             artwork_url = artwork_data
+
+    # Stabilize artwork against brief transients: if artwork disappears only briefly,
+    # keep last seen artwork until TTL expires so the ESP doesn't flicker or lose image.
+    global _last_seen_artwork_url, _last_seen_artwork_ts
+    now_ts = time.time()
+    if artwork_url:
+        _last_seen_artwork_url = artwork_url
+        _last_seen_artwork_ts = now_ts
+    else:
+        # If we have a last seen artwork and it's within TTL, use it instead
+        if _last_seen_artwork_url and (now_ts - _last_seen_artwork_ts) <= _ARTWORK_TTL:
+            artwork_url = _last_seen_artwork_url
     
     # Just indicate if artwork exists (actual image sent separately)
     media["has_artwork"] = artwork_url is not None
@@ -747,16 +991,44 @@ def send_artwork_to_esp(url: str):
         if SERIAL_DEBUG:
             print(f"[IMAGE] Sending {len(rgb565_b64)} bytes base64...")
         
-        # Send in chunks (512 bytes per chunk to be safe)
+        # Send in chunks (512 bytes per chunk to be safe), but use serial writer queue instead of direct writes
         CHUNK_SIZE = 512
+        # Enqueue as priority messages - send small chunks to allow other writes to proceed
         for i in range(0, len(rgb565_b64), CHUNK_SIZE):
             chunk = rgb565_b64[i:i + CHUNK_SIZE]
             line = f"IMG:{chunk}\n"
-            ser.write(line.encode("utf-8"))
-            time.sleep(0.01)  # Small delay between chunks
+            line_bytes = line.encode("utf-8")
+            try:
+                if _serial_priority_queue.full():
+                    try:
+                        _serial_priority_queue.get_nowait()
+                        _serial_priority_queue.task_done()
+                    except Exception:
+                        pass
+                _serial_priority_queue.put({"type":"artwork_chunk","payload": line_bytes, "url": url}, block=False)
+            except Exception:
+                # If priority queue is full or multiple serial writes, fallback to direct write as last resort
+                try:
+                    ser.write(line_bytes)
+                    time.sleep(0.01)
+                except Exception:
+                    pass
         
-        # Signal end of image
-        ser.write(b"IMG_END\n")
+        # Signal end of image - use priority queue
+        try:
+            end_line = b"IMG_END\n"
+            if _serial_priority_queue.full():
+                try:
+                    _serial_priority_queue.get_nowait()
+                    _serial_priority_queue.task_done()
+                except Exception:
+                    pass
+            _serial_priority_queue.put({"type":"artwork_chunk","payload": end_line, "url": url}, block=False)
+        except Exception:
+            try:
+                ser.write(b"IMG_END\n")
+            except Exception:
+                pass
         
         _last_artwork_url = url
         
@@ -853,12 +1125,13 @@ if __name__ == "__main__":
     # Start serial command reader (if serial opened)
     if ser is not None:
         threading.Thread(target=serial_command_loop, daemon=True).start()
+        threading.Thread(target=_serial_writer_loop, daemon=True).start()
 
     # Prime psutil counters
     prime_psutil()
 
-    # Start background system monitor (1.0s = 1 Hz to match progress bar updates)
-    socketio.start_background_task(system_monitor_loop, 1.0)
+    # Start background system monitor (can be tuned: 0.05 = 20 Hz, 0.1 = 10 Hz)
+    socketio.start_background_task(system_monitor_loop, 0.05)
 
     print("[SERVER RUNNING] Flask-SocketIO on port 8080...")
     # IMPORTANT: no reloader, single process => only one serial owner
