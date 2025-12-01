@@ -18,6 +18,8 @@ import datetime
 import time
 import serial
 from serial import SerialException, SerialTimeoutException
+from control_media import spotifyPlay, spotifyPause, spotifyNext, spotifyPrevious
+from image_utils import get_artwork_rgb565_base64, clear_cache as clear_image_cache
 
 # GPU monitoring (optional - works with NVIDIA GPUs)
 try:
@@ -110,7 +112,7 @@ def get_system_snapshot():
         data["battery_percent"] = None
         data["power_plugged"] = None
 
-    # Per-process CPU (normalized by core count)
+    # Per-process Memory percentage (normalized by machine) for top processes
     n_cpus = psutil.cpu_count(logical=True) or 1
 
     processes = []
@@ -121,20 +123,27 @@ def get_system_snapshot():
             if name.lower() in ("system idle process", "idle"):
                 continue
 
-            cpu_p = proc.cpu_percent(interval=None) / n_cpus
+            # Use memory percentage for sorting
+            try:
+                mem_p = proc.memory_percent()
+            except Exception:
+                mem_p = 0.0
             # Clamp to [0, 100] for display sanity
-            if cpu_p < 0:
-                cpu_p = 0.0
-            if cpu_p > 100.0:
-                cpu_p = 100.0
+            if mem_p < 0:
+                mem_p = 0.0
+            if mem_p > 100.0:
+                mem_p = 100.0
 
-            if cpu_p > 0.1:
-                processes.append((cpu_p, name))
+            if mem_p > 0.1:
+                processes.append((mem_p, proc.pid, name))
         except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
             continue
 
     procs_sorted = sorted(processes, key=lambda x: x[0], reverse=True)[:5]
-    data["cpu_top5_process"] = [f"{p[0]:.1f}% {p[1]}" for p in procs_sorted]
+    # Provide both a backward-compatible `cpu_top5_process` (string list) and a richer 'proc_top5'
+    data["cpu_top5_process"] = [f"{p[0]:.1f}% {p[2]}" for p in procs_sorted]
+    # Rich object list for the ESP to parse PID + mem% + name
+    data["proc_top5"] = [{"pid": p[1], "mem": round(p[0], 1), "name": p[2]} for p in procs_sorted]
     return data
 
 
@@ -146,7 +155,9 @@ def system_monitor_loop(interval=2):
 
         # NEW: attach media block from Spotify / metadata globals
         media = get_media_snapshot()
+        artwork_url = None
         if media is not None:
+            artwork_url = media.pop("artwork_url", None)  # Remove URL from JSON (sent separately)
             snapshot["media"] = media
 
         # 1) Emit to web clients via Socket.IO
@@ -157,8 +168,13 @@ def system_monitor_loop(interval=2):
             try:
                 line = json.dumps(snapshot) + "\n"
                 if SERIAL_DEBUG:
-                    print(f"[SERIAL OUT] {line.strip()}")
+                    print(f"[SERIAL OUT] {line.strip()[:100]}...")
                 ser.write(line.encode("utf-8"))
+                
+                # Send artwork separately if URL changed
+                if artwork_url:
+                    send_artwork_to_esp(artwork_url)
+                    
             except SerialTimeoutException:
                 print("[SERIAL ERROR] Timeout writing to ESP.")
             except SerialException as e:
@@ -170,6 +186,87 @@ def system_monitor_loop(interval=2):
                 ser = None
 
         socketio.sleep(interval)
+
+
+def serial_command_loop():
+        """Background loop that reads commands from the ESP via serial and acts on them."""
+        global ser
+        if ser is None:
+            return
+        while True:
+            try:
+                if ser.in_waiting:
+                    line = ser.readline().decode("utf-8", errors="ignore").strip()
+                    if not line:
+                        continue
+                    # Try to parse JSON commands
+                    try:
+                        cmd = json.loads(line)
+                    except Exception:
+                        # Non-JSON lines can be ignored or print for debugging
+                        if SERIAL_DEBUG:
+                            print(f"[SERIAL IN] {line}")
+                        continue
+
+                    if not isinstance(cmd, dict):
+                        continue
+
+                    typ = cmd.get("cmd") or cmd.get("type")
+                    if not typ:
+                        continue
+
+                    if typ == "kill":
+                        pid = cmd.get("pid")
+                        if pid is not None:
+                            try:
+                                pid = int(pid)
+                                # Reuse existing logic: kill by pid using psutil
+                                proc = psutil.Process(pid)
+                                proc.terminate()
+                                try:
+                                    proc.wait(timeout=3)
+                                    status = "terminated"
+                                except psutil.TimeoutExpired:
+                                    proc.kill()
+                                    status = "killed"
+                                if SERIAL_DEBUG:
+                                    print(f"[SERIAL CMD] Killed pid={pid} status={status}")
+                            except Exception as e:
+                                if SERIAL_DEBUG:
+                                    print(f"[SERIAL CMD] Error killing pid {pid}: {e}")
+
+                    elif typ == "play":
+                        try:
+                            spotifyPlay()
+                        except Exception as e:
+                            if SERIAL_DEBUG:
+                                print(f"[SERIAL CMD] Play error: {e}")
+                    elif typ == "pause":
+                        try:
+                            spotifyPause()
+                        except Exception as e:
+                            if SERIAL_DEBUG:
+                                print(f"[SERIAL CMD] Pause error: {e}")
+                    elif typ == "next":
+                        try:
+                            spotifyNext()
+                        except Exception as e:
+                            if SERIAL_DEBUG:
+                                print(f"[SERIAL CMD] Next error: {e}")
+                    elif typ == "previous":
+                        try:
+                            spotifyPrevious()
+                        except Exception as e:
+                            if SERIAL_DEBUG:
+                                print(f"[SERIAL CMD] Prev error: {e}")
+                    else:
+                        if SERIAL_DEBUG:
+                            print(f"[SERIAL CMD] Unknown cmd: {cmd}")
+
+            except Exception as e:
+                if SERIAL_DEBUG:
+                    print(f"[SERIAL CMD] Reader exception: {e}")
+            time.sleep(0.05)
 
 
 def prime_psutil():
@@ -419,6 +516,9 @@ def get_metadata():
         "album": album_data,
         "artwork": artwork_data
     }
+# Track last sent artwork URL to avoid redundant sends
+_last_artwork_url = None
+
 def get_media_snapshot():
     """
     Build a media snapshot from the current Spotify metadata globals.
@@ -440,12 +540,66 @@ def get_media_snapshot():
         "duration_seconds": 0,
     }
 
-    # If your frontend is already sending base64 PNG, just forward it.
-    # If it's a URL, the ESP's base64 decode will fail but text UI still works.
+    # Extract artwork URL - artwork_data can be a URL string or {"src": url} object
+    artwork_url = None
     if artwork_data:
-        media["artwork_b64"] = artwork_data
+        if isinstance(artwork_data, dict) and "src" in artwork_data:
+            artwork_url = artwork_data["src"]
+        elif isinstance(artwork_data, str) and artwork_data.startswith("http"):
+            artwork_url = artwork_data
+    
+    # Just indicate if artwork exists (actual image sent separately)
+    media["has_artwork"] = artwork_url is not None
+    media["artwork_url"] = artwork_url  # Store for separate image send
 
     return media
+
+
+def send_artwork_to_esp(url: str):
+    """
+    Download image, convert to RGB565, and send to ESP in chunks.
+    Sends as: IMG:<base64_chunk>\n
+    Final chunk: IMG_END\n
+    """
+    global ser, _last_artwork_url
+    
+    if ser is None or not url:
+        return
+    
+    # Skip if same URL already sent
+    if url == _last_artwork_url:
+        return
+    
+    try:
+        if SERIAL_DEBUG:
+            print(f"[IMAGE] Downloading: {url[:60]}...")
+        
+        rgb565_b64 = get_artwork_rgb565_base64(url)
+        if rgb565_b64 is None:
+            print("[IMAGE] Failed to get artwork")
+            return
+        
+        if SERIAL_DEBUG:
+            print(f"[IMAGE] Sending {len(rgb565_b64)} bytes base64...")
+        
+        # Send in chunks (512 bytes per chunk to be safe)
+        CHUNK_SIZE = 512
+        for i in range(0, len(rgb565_b64), CHUNK_SIZE):
+            chunk = rgb565_b64[i:i + CHUNK_SIZE]
+            line = f"IMG:{chunk}\n"
+            ser.write(line.encode("utf-8"))
+            time.sleep(0.01)  # Small delay between chunks
+        
+        # Signal end of image
+        ser.write(b"IMG_END\n")
+        
+        _last_artwork_url = url
+        
+        if SERIAL_DEBUG:
+            print("[IMAGE] Sent successfully")
+            
+    except Exception as e:
+        print(f"[IMAGE] Error sending: {e}")
 
 def handle_user_input():
     from control_media import (
@@ -530,6 +684,10 @@ if __name__ == "__main__":
             print(f"[SERIAL ERROR] Could not open port {SERIAL_PORT}: {e}")
             ser = None
     # =================================
+
+    # Start serial command reader (if serial opened)
+    if ser is not None:
+        threading.Thread(target=serial_command_loop, daemon=True).start()
 
     # Prime psutil counters
     prime_psutil()

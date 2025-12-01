@@ -6,3 +6,4 @@ requests
 psutil
 pyserial
 GPUtil
+Pillow
