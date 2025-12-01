@@ -18,8 +18,8 @@ import datetime
 import time
 import serial
 from serial import SerialException, SerialTimeoutException
-from control_media import spotifyPlay, spotifyPause, spotifyNext, spotifyPrevious
-from image_utils import get_artwork_rgb565_base64, clear_cache as clear_image_cache
+from control_media import spotifyPlay, spotifyPause, spotifyNext, spotifyPrevious, media_play_pause, media_next, media_previous, get_spotify_progress
+from image_utils import get_artwork_rgb565_base64, get_artwork_png_b64, clear_cache as clear_image_cache
 
 # GPU monitoring (optional - works with NVIDIA GPUs)
 try:
@@ -41,6 +41,11 @@ title_data = ""
 artist_data = ""
 album_data = ""
 artwork_data = ""
+# Progress data from browser extension (for YouTube, etc.)
+position_data = 0  # Current position in seconds
+duration_data = 0  # Total duration in seconds
+is_playing_data = False  # Whether media is currently playing
+media_source = ""  # Track which source the media is from (e.g., "youtube", "spotify")
 client_creds = f"{CLIENT_ID}:{CLIENT_SECRET}"
 encoded = base64.b64encode(client_creds.encode()).decode()
 
@@ -158,6 +163,15 @@ def system_monitor_loop(interval=2):
         artwork_url = None
         if media is not None:
             artwork_url = media.pop("artwork_url", None)  # Remove URL from JSON (sent separately)
+            
+            # Add PNG artwork as base64 directly in the JSON (only if we have a URL)
+            if artwork_url:
+                if SERIAL_DEBUG:
+                    print(f"[ARTWORK] Fetching from: {artwork_url[:80]}...")
+                png_b64 = get_artwork_png_b64(artwork_url)
+                if png_b64:
+                    media["artwork_png_b64"] = png_b64
+            
             snapshot["media"] = media
 
         # 1) Emit to web clients via Socket.IO
@@ -168,12 +182,10 @@ def system_monitor_loop(interval=2):
             try:
                 line = json.dumps(snapshot) + "\n"
                 if SERIAL_DEBUG:
-                    print(f"[SERIAL OUT] {line.strip()[:100]}...")
+                    # Truncate for debug display (artwork can be large)
+                    display_line = line[:200] + "..." if len(line) > 200 else line.strip()
+                    print(f"[SERIAL OUT] {display_line}")
                 ser.write(line.encode("utf-8"))
-                
-                # Send artwork separately if URL changed
-                if artwork_url:
-                    send_artwork_to_esp(artwork_url)
                     
             except SerialTimeoutException:
                 print("[SERIAL ERROR] Timeout writing to ESP.")
@@ -237,25 +249,29 @@ def serial_command_loop():
 
                     elif typ == "play":
                         try:
-                            spotifyPlay()
+                            # Use keyboard media key - works with any player
+                            media_play_pause()
                         except Exception as e:
                             if SERIAL_DEBUG:
                                 print(f"[SERIAL CMD] Play error: {e}")
                     elif typ == "pause":
                         try:
-                            spotifyPause()
+                            # Use keyboard media key - works with any player
+                            media_play_pause()
                         except Exception as e:
                             if SERIAL_DEBUG:
                                 print(f"[SERIAL CMD] Pause error: {e}")
                     elif typ == "next":
                         try:
-                            spotifyNext()
+                            # Use keyboard media key - works with any player
+                            media_next()
                         except Exception as e:
                             if SERIAL_DEBUG:
                                 print(f"[SERIAL CMD] Next error: {e}")
                     elif typ == "previous":
                         try:
-                            spotifyPrevious()
+                            # Use keyboard media key - works with any player
+                            media_previous()
                         except Exception as e:
                             if SERIAL_DEBUG:
                                 print(f"[SERIAL CMD] Prev error: {e}")
@@ -346,6 +362,50 @@ def receive_artwork(data):
     global artwork_data
     artwork_data = data
     print(f"[RECEIVED ARTWORK]: {artwork_data}")
+
+
+@socketio.on("sendPosition")
+def receive_position(data):
+    """Receive current playback position in seconds from browser extension."""
+    global position_data
+    try:
+        position_data = int(float(data))
+    except (ValueError, TypeError):
+        position_data = 0
+    # Only print occasionally to avoid spam
+    # print(f"[RECEIVED POSITION]: {position_data}s")
+
+
+@socketio.on("sendDuration")
+def receive_duration(data):
+    """Receive total duration in seconds from browser extension."""
+    global duration_data
+    try:
+        duration_data = int(float(data))
+    except (ValueError, TypeError):
+        duration_data = 0
+    print(f"[RECEIVED DURATION]: {duration_data}s")
+
+
+@socketio.on("sendPlaying")
+def receive_playing(data):
+    """Receive play/pause state from browser extension."""
+    global is_playing_data
+    if isinstance(data, bool):
+        is_playing_data = data
+    elif isinstance(data, str):
+        is_playing_data = data.lower() in ("true", "1", "playing")
+    else:
+        is_playing_data = bool(data)
+    print(f"[RECEIVED PLAYING STATE]: {is_playing_data}")
+
+
+@socketio.on("sendSource")
+def receive_source(data):
+    """Receive media source identifier (e.g., 'youtube', 'spotify')."""
+    global media_source
+    media_source = str(data).lower() if data else ""
+    print(f"[RECEIVED SOURCE]: {media_source}")
 
 
 # === TASK MANAGER ADDITIONS: HTTP + SOCKET ENDPOINTS ===
@@ -521,23 +581,42 @@ _last_artwork_url = None
 
 def get_media_snapshot():
     """
-    Build a media snapshot from the current Spotify metadata globals.
-    This will be embedded in the JSON sent over serial under the 'media' key.
+    Build a media snapshot from current metadata.
+    Uses Spotify API for progress if Spotify is active, otherwise uses browser extension data.
     """
     global title_data, artist_data, album_data, artwork_data
+    global position_data, duration_data, is_playing_data, media_source
 
     # If nothing is set yet, skip media entirely
     if not title_data and not artist_data and not album_data and not artwork_data:
         return None
 
+    # Determine if we should use Spotify API or browser extension data
+    # Use Spotify API only if media source is spotify or if we don't have browser progress data
+    use_spotify_api = (media_source == "spotify" or 
+                       ("spotify" in artist_data.lower() if artist_data else False))
+    
+    if use_spotify_api:
+        # Try Spotify API for progress
+        position_sec, duration_sec, is_playing = get_spotify_progress()
+        # If Spotify returns no data, fall back to browser data
+        if duration_sec == 0 and duration_data > 0:
+            position_sec = position_data
+            duration_sec = duration_data
+            is_playing = is_playing_data
+    else:
+        # Use browser extension data (YouTube, etc.)
+        position_sec = position_data
+        duration_sec = duration_data
+        is_playing = is_playing_data
+
     media = {
         "title": title_data or "",
         "artist": artist_data or "",
         "album": album_data or "",
-        # For now, if you don't have real timing, keep 0 / 0.
-        # Later you can wire these up from getPlayerInfo().
-        "position_seconds": 0,
-        "duration_seconds": 0,
+        "position_seconds": position_sec,
+        "duration_seconds": duration_sec,
+        "is_playing": is_playing,
     }
 
     # Extract artwork URL - artwork_data can be a URL string or {"src": url} object

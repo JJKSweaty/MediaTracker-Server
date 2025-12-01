@@ -19,6 +19,8 @@ spotify_data = {
     "album": "",
     "artwork": "",
     "is_playing": False,
+    "progress_ms": 0,
+    "duration_ms": 0,
 }
 
 
@@ -154,6 +156,9 @@ def getPlayerInfo():
             spotify_data["album"] = data["item"]["album"]["name"]
             spotify_data["artwork"] = data["item"]["album"]["images"][0]["url"]
             spotify_data["is_playing"] = data["is_playing"]
+            # Add progress and duration (in milliseconds from API, convert to seconds)
+            spotify_data["progress_ms"] = data.get("progress_ms", 0)
+            spotify_data["duration_ms"] = data.get("item", {}).get("duration_ms", 0)
         else:
             Auth()
             print("Error: Could not get player info")
@@ -247,4 +252,111 @@ def spotifyVolume(volume_percent):
             print("Error: Could not change volume")
             print(response.text)
 
+def get_spotify_progress():
+    """
+    Get current playback progress from Spotify API.
+    Returns (position_seconds, duration_seconds, is_playing) or (0, 0, False) on error.
+    """
+    try:
+        if authorized_req():
+            tokens = load_tokens()
+            access_token = tokens["access_token"]
+            response = requests.get(
+                "https://api.spotify.com/v1/me/player/currently-playing",
+                headers={"Authorization": f"Bearer {access_token}"},
+                timeout=2
+            )
+            if response.status_code == 200:
+                data = response.json()
+                progress_ms = data.get("progress_ms", 0)
+                duration_ms = data.get("item", {}).get("duration_ms", 0)
+                is_playing = data.get("is_playing", False)
+                # Convert to seconds
+                pos_sec = progress_ms // 1000
+                dur_sec = duration_ms // 1000
+                print(f"[SPOTIFY PROGRESS] pos={pos_sec}s dur={dur_sec}s playing={is_playing}")
+                return (pos_sec, dur_sec, is_playing)
+            elif response.status_code == 204:
+                # No content - nothing playing
+                return (0, 0, False)
+            else:
+                print(f"[SPOTIFY PROGRESS] API returned {response.status_code}")
+        else:
+            print("[SPOTIFY PROGRESS] Not authorized")
+    except Exception as e:
+        print(f"[SPOTIFY PROGRESS] Error: {e}")
+    return (0, 0, False)
+
 # SPOTIFY SECTION ENDS HERE
+
+
+# ========================================
+# KEYBOARD MEDIA KEY CONTROLS
+# Works with any media player (Spotify, VLC, YouTube, etc.)
+# ========================================
+import ctypes
+
+# Windows Virtual Key Codes for Media Keys
+VK_MEDIA_PLAY_PAUSE = 0xB3
+VK_MEDIA_NEXT_TRACK = 0xB0
+VK_MEDIA_PREV_TRACK = 0xB1
+VK_MEDIA_STOP = 0xB2
+VK_VOLUME_MUTE = 0xAD
+VK_VOLUME_DOWN = 0xAE
+VK_VOLUME_UP = 0xAF
+
+# Windows API constants
+KEYEVENTF_EXTENDEDKEY = 0x0001
+KEYEVENTF_KEYUP = 0x0002
+
+def press_media_key(vk_code):
+    """Simulate a media key press using Windows API."""
+    try:
+        # Key down
+        ctypes.windll.user32.keybd_event(vk_code, 0, KEYEVENTF_EXTENDEDKEY, 0)
+        time.sleep(0.05)
+        # Key up
+        ctypes.windll.user32.keybd_event(vk_code, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP, 0)
+        return True
+    except Exception as e:
+        print(f"[MEDIA KEY] Error: {e}")
+        return False
+
+def media_play_pause():
+    """Toggle play/pause for any active media player."""
+    print("[MEDIA KEY] Play/Pause pressed")
+    return press_media_key(VK_MEDIA_PLAY_PAUSE)
+
+def media_next():
+    """Skip to next track."""
+    print("[MEDIA KEY] Next Track pressed")
+    return press_media_key(VK_MEDIA_NEXT_TRACK)
+
+def media_previous():
+    """Go to previous track."""
+    print("[MEDIA KEY] Previous Track pressed")
+    return press_media_key(VK_MEDIA_PREV_TRACK)
+
+def media_stop():
+    """Stop playback."""
+    print("[MEDIA KEY] Stop pressed")
+    return press_media_key(VK_MEDIA_STOP)
+
+def media_volume_up():
+    """Increase system volume."""
+    print("[MEDIA KEY] Volume Up pressed")
+    return press_media_key(VK_VOLUME_UP)
+
+def media_volume_down():
+    """Decrease system volume."""
+    print("[MEDIA KEY] Volume Down pressed")
+    return press_media_key(VK_VOLUME_DOWN)
+
+def media_mute():
+    """Toggle mute."""
+    print("[MEDIA KEY] Mute pressed")
+    return press_media_key(VK_VOLUME_MUTE)
+
+# ========================================
+# KEYBOARD MEDIA KEY SECTION ENDS HERE
+# ========================================

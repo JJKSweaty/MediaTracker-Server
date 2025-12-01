@@ -7,6 +7,12 @@ import base64
 import requests
 from PIL import Image
 
+# Enable AVIF support (YouTube often serves AVIF thumbnails)
+try:
+    import pillow_avif
+except ImportError:
+    pass  # AVIF support not available
+
 # Target size for ESP32 display (80x80 pixels)
 TARGET_WIDTH = 80
 TARGET_HEIGHT = 80
@@ -14,6 +20,7 @@ TARGET_HEIGHT = 80
 # Cache to avoid re-downloading the same image
 _last_url = None
 _last_rgb565 = None
+_last_png_b64 = None
 
 
 def url_to_rgb565(url: str) -> bytes:
@@ -53,6 +60,102 @@ def url_to_rgb565(url: str) -> bytes:
         
     except Exception as e:
         print(f"[IMAGE] Error downloading/converting: {e}")
+        return None
+
+
+def get_artwork_png_b64(artwork_url: str) -> str:
+    """
+    Download artwork, resize to 80x80, convert to RGB565, and return as base64 string.
+    RGB565 is used because LVGL on ESP32 can display it directly without a PNG decoder.
+    """
+    global _last_url, _last_png_b64
+    
+    if not artwork_url:
+        return None
+    
+    # Handle dict format {'src': 'url'}
+    if isinstance(artwork_url, dict):
+        artwork_url = artwork_url.get('src', '')
+    
+    if not artwork_url or not artwork_url.startswith('http'):
+        return None
+    
+    # Return cached if same URL
+    if artwork_url == _last_url and _last_png_b64 is not None:
+        return _last_png_b64
+    
+    try:
+        # Request JPEG/PNG explicitly to avoid AVIF (which PIL doesn't support natively)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'image/jpeg,image/png,image/webp,image/*;q=0.8',
+        }
+        resp = requests.get(artwork_url, timeout=5, headers=headers)
+        resp.raise_for_status()
+        
+        # Check if we got actual image data
+        content_type = resp.headers.get('Content-Type', '')
+        if resp.content[:4] == b'<htm' or resp.content[:5] == b'<!DOC':
+            print(f"[IMAGE] Received HTML instead of image from {artwork_url[:50]}...")
+            return None
+        
+        # Check we have enough data
+        if len(resp.content) < 100:
+            print(f"[IMAGE] Response too small ({len(resp.content)} bytes)")
+            return None
+        
+        # Check for AVIF format (PIL doesn't support it natively)
+        if b'ftypavif' in resp.content[:32] or 'avif' in content_type.lower():
+            print(f"[IMAGE] Received AVIF format - trying alternate URL...")
+            # For YouTube, try replacing hqdefault with mqdefault or sddefault
+            # Or try adding a format parameter
+            alt_url = artwork_url.replace('hqdefault', 'mqdefault')
+            if alt_url != artwork_url:
+                resp = requests.get(alt_url, timeout=5, headers=headers)
+                resp.raise_for_status()
+                if b'ftypavif' in resp.content[:32]:
+                    print(f"[IMAGE] Still AVIF, skipping artwork")
+                    return None
+        
+        # Load image from bytes
+        img_bytes = io.BytesIO(resp.content)
+        try:
+            img = Image.open(img_bytes)
+            img.load()  # Force load to catch any decoding errors
+        except Exception as img_err:
+            # Try to identify what we received
+            preview = resp.content[:50]
+            print(f"[IMAGE] Cannot open image ({len(resp.content)} bytes, type={content_type})")
+            print(f"[IMAGE] First bytes: {preview}")
+            return None
+        
+        # Convert to RGB if needed (handles RGBA, P, etc.)
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Resize to target size
+        img = img.resize((TARGET_WIDTH, TARGET_HEIGHT), Image.LANCZOS)
+        
+        # Convert to RGB565 bytes
+        rgb565_bytes = rgb_to_rgb565(img)
+        
+        # Base64 encode
+        b64 = base64.b64encode(rgb565_bytes).decode("ascii")
+        
+        # Cache it
+        _last_url = artwork_url
+        _last_png_b64 = b64
+        
+        print(f"[IMAGE] RGB565 b64 size: {len(b64)} chars ({len(rgb565_bytes)} bytes)")
+        return b64
+        
+    except requests.RequestException as e:
+        print(f"[IMAGE] Network error fetching artwork: {e}")
+        return None
+    except Exception as e:
+        print(f"[IMAGE] Error getting artwork: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -110,6 +213,7 @@ def get_artwork_rgb565_base64(url: str) -> str:
 
 def clear_cache():
     """Clear the image cache."""
-    global _last_url, _last_rgb565
+    global _last_url, _last_rgb565, _last_png_b64
     _last_url = None
     _last_rgb565 = None
+    _last_png_b64 = None
