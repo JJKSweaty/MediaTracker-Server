@@ -25,6 +25,9 @@ from image_utils import get_artwork_rgb565_base64, get_artwork_png_b64, clear_ca
 # Spotify Queue Manager for playlist/queue features
 from spotify_queue import get_queue_manager, SpotifyQueueManager
 
+# Transport abstraction for Serial/TCP communication
+from transport import get_transport_manager, TransportManager
+
 # GPU monitoring (optional - works with NVIDIA GPUs)
 try:
     import GPUtil
@@ -50,6 +53,13 @@ position_data = 0  # Current position in seconds
 duration_data = 0  # Total duration in seconds
 is_playing_data = False  # Whether media is currently playing
 media_source = ""  # Track which source the media is from (e.g., "youtube", "spotify")
+# YouTube playlist data from browser extension
+youtube_playlist_data = {
+    "name": "",           # Playlist name
+    "videos": [],         # List of videos in playlist [{title, channel, thumbnail, video_id, index}]
+    "current_index": 0,   # Current video index
+    "total_videos": 0,    # Total videos in playlist
+}
 client_creds = f"{CLIENT_ID}:{CLIENT_SECRET}"
 encoded = base64.b64encode(client_creds.encode()).decode()
 
@@ -68,7 +78,14 @@ _last_sent_snapshot_fingerprint = None
 SERIAL_MAX_QUEUE = int(os.getenv("SERIAL_MAX_QUEUE", "8"))
 SERIAL_DEBUG = os.getenv("SERIAL_DEBUG", "1") in ("1", "true", "True")
 DISABLE_AUTO_SERIAL = os.getenv("DISABLE_AUTO_SERIAL", "0") in ("1", "true", "True")
-# =============================
+
+# === TRANSPORT CONFIG (WiFi + Serial) ===
+# Transport mode: "serial", "tcp", or "both" (default: both)
+TRANSPORT_MODE = os.getenv("TRANSPORT_MODE", "both").lower()
+# TCP server port for WiFi connection from ESP32
+TCP_PORT = int(os.getenv("TCP_PORT", "5555"))
+TCP_HOST = os.getenv("TCP_HOST", "0.0.0.0")
+# ========================================
 
 # Basic validation to help debug Spotify auth issues quickly
 if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
@@ -170,6 +187,28 @@ def get_system_snapshot():
 
     # Provide both a backward-compatible `cpu_top5_process` (string list) and a richer 'proc_top5'
     # Create display-friendly names (strip .exe and paths)
+    
+    # Friendly name mappings for common apps
+    FRIENDLY_NAMES = {
+        "code": "VS Code",
+        "Code": "VS Code",
+        "msedge": "Edge",
+        "chrome": "Chrome",
+        "firefox": "Firefox",
+        "brave": "Brave",
+        "spotify": "Spotify",
+        "discord": "Discord",
+        "slack": "Slack",
+        "teams": "Teams",
+        "explorer": "Explorer",
+        "Memory Compression": "Sys Memory",  # Windows memory compression process
+        "vmmem": "WSL Memory",  # WSL virtual machine memory
+        "dwm": "Desktop WM",  # Desktop Window Manager
+        "SearchHost": "Search",
+        "RuntimeBroker": "Runtime",
+        "svchost": "System",
+    }
+    
     cleaned = []
     for p in procs_sorted:
         mem_p, pid, name = p
@@ -182,6 +221,11 @@ def get_system_snapshot():
         display_name = name_str
         if display_name.lower().endswith(".exe"):
             display_name = display_name[:-4]
+        
+        # Apply friendly name mapping
+        if display_name in FRIENDLY_NAMES:
+            display_name = FRIENDLY_NAMES[display_name]
+        
         cleaned.append((mem_p, pid, name_str, display_name))
 
     data["cpu_top5_process"] = [f"{p[0]:.1f}% {p[3]}" for p in cleaned]
@@ -273,8 +317,9 @@ def system_monitor_loop(interval=2.0):
         # 1) Emit to web clients via Socket.IO
         socketio.emit("system_info", snapshot)
 
-        # 2) Send to ESP via serial as newline-terminated JSON (fast, no artwork)
-        if ser is not None:
+        # 2) Send to ESP via transport manager (Serial and/or TCP)
+        transport_mgr = get_transport_manager()
+        if transport_mgr.is_connected:
             try:
                 line = json.dumps(snapshot) + "\n"
                 line_bytes = line.encode("utf-8")
@@ -307,6 +352,11 @@ def system_monitor_loop(interval=2.0):
 
                 if should_send_snapshot:
                     try:
+                        # Use transport manager for sending (supports both Serial and TCP)
+                        transport_mgr = get_transport_manager()
+                        transport_mgr.queue_send(line_bytes, priority=False)
+                        
+                        # Also use legacy queue for backward compatibility
                         if _serial_queue.qsize() >= SERIAL_MAX_QUEUE:
                             # Drop older message to make space and keep latest
                             try:
@@ -328,10 +378,17 @@ def system_monitor_loop(interval=2.0):
 
                 if ready_b64 and ready_url and ready_url != _last_artwork_url:
                     print(f"[ARTWORK] Queuing to ESP... ({len(ready_b64)} chars) url={ready_url}")
+                    # Mark as sent IMMEDIATELY to prevent re-queuing on next loop
+                    _last_artwork_url = ready_url
+                    
                     artwork_msg = json.dumps({"artwork_b64": ready_b64}) + "\n"
                     msg_bytes = artwork_msg.encode("utf-8")
                     try:
-                        # If priority queue is full, remove older artwork to make room
+                        # Use transport manager for artwork (priority)
+                        transport_mgr = get_transport_manager()
+                        transport_mgr.queue_send(msg_bytes, priority=True, metadata={"type": "artwork", "url": ready_url})
+                        
+                        # Also use legacy queue for backward compatibility
                         if _serial_priority_queue.full():
                             try:
                                 _serial_priority_queue.get_nowait()
@@ -342,19 +399,13 @@ def system_monitor_loop(interval=2.0):
                     except Exception as e:
                         if SERIAL_DEBUG:
                             print(f"[SERIAL WRITER] Artwork queue put failed: {e}")
-            except SerialTimeoutException:
-                print("[SERIAL ERROR] Timeout writing to ESP.")
-            except SerialException as e:
-                print(f"[SERIAL ERROR] {e}")
-                try:
-                    ser.close()
-                except Exception:
-                    pass
-                ser = None
+            except Exception as e:
+                if SERIAL_DEBUG:
+                    print(f"[TRANSPORT ERROR] {e}")
         else:
-            # Debug: show if serial is not connected
-            if loop_start % 10 < 1:  # Print every ~10 seconds
-                print("[WARNING] Serial not connected, data not sent to ESP")
+            # Debug: show if transport is not connected
+            if int(loop_start) % 10 == 0:  # Print every ~10 seconds
+                print("[WARNING] No transport connected, data not sent to ESP")
 
         # Precise periodic scheduling
         next_time += interval
@@ -368,28 +419,53 @@ def _handle_queue_action(cmd: dict):
     """
     Handle queue actions from ESP32.
     Commands:
-      - {"type": "queue_action", "action": "play_now", "track_id": "spotify:track:XXX"}
-      - {"type": "queue_action", "action": "remove", "track_id": "spotify:track:XXX", "playlist_id": "..."}
-      - {"type": "queue_action", "action": "add_to_queue", "track_id": "spotify:track:XXX"}
-      - {"type": "queue_action", "action": "reorder", "playlist_id": "...", "from_index": 0, "to_index": 5}
+      - {"cmd": "queue_action", "action": "play_now", "index": 0}  (ESP32 uses index)
+      - {"cmd": "queue_action", "action": "play_now", "track_id": "spotify:track:XXX"}
+      - {"cmd": "queue_action", "action": "remove", "track_id": "spotify:track:XXX", "playlist_id": "..."}
+      - {"cmd": "queue_action", "action": "add_to_queue", "track_id": "spotify:track:XXX"}
+      - {"cmd": "queue_action", "action": "reorder", "from_index": 0, "to_index": 2}
     """
     action = cmd.get("action", "")
     track_id = cmd.get("track_id", "")
+    index = cmd.get("index")
+    source = "spotify"  # Default to spotify
     
     try:
         queue_mgr = get_queue_manager()
+        
+        # If index is provided, look up the track_id from the queue
+        if index is not None and not track_id:
+            # Get fresh queue state
+            queue_state = queue_mgr.get_current_queue(force_refresh=True)
+            up_next = queue_state.up_next
+            
+            if up_next and 0 <= index < len(up_next):
+                track_item = up_next[index]
+                track_id = track_item.track_id
+                source = track_item.source
+                if SERIAL_DEBUG:
+                    print(f"[QUEUE CMD] Resolved index {index} to track_id: {track_id} (source: {source})")
+            else:
+                print(f"[QUEUE CMD] Index {index} out of range (queue has {len(up_next) if up_next else 0} items)")
+                return
         
         if action == "play_now":
             if not track_id:
                 print("[QUEUE CMD] play_now missing track_id")
                 return
             # Check if it's a local track (can't play via API)
-            if ":local:" in track_id:
+            if ":local:" in track_id or source == "local":
                 print(f"[QUEUE CMD] Cannot play local track via API: {track_id}")
                 return
+            # Check if it's a non-Spotify track
+            if source and source != "spotify":
+                print(f"[QUEUE CMD] Cannot play {source} track via Spotify API: {track_id}")
+                return
+            if not track_id.startswith("spotify:"):
+                print(f"[QUEUE CMD] Invalid Spotify URI: {track_id}")
+                return
             success = queue_mgr.play_track(track_id)
-            if SERIAL_DEBUG:
-                print(f"[QUEUE CMD] play_now {track_id}: {'OK' if success else 'FAIL'}")
+            print(f"[QUEUE CMD] play_now {track_id}: {'OK' if success else 'FAIL'}")
         
         elif action == "add_to_queue":
             if not track_id:
@@ -413,16 +489,23 @@ def _handle_queue_action(cmd: dict):
                 print(f"[QUEUE CMD] remove {track_id} from {playlist_id}: {'OK' if new_snap else 'FAIL'}")
         
         elif action == "reorder":
+            # Reordering queue directly is not supported by Spotify API
+            # For playlist reordering, we need playlist_id
             playlist_id = cmd.get("playlist_id", "")
             from_idx = cmd.get("from_index", 0)
             to_idx = cmd.get("to_index", 0)
             snapshot_id = cmd.get("snapshot_id")
-            if not playlist_id:
-                print("[QUEUE CMD] reorder missing playlist_id")
-                return
-            new_snap = queue_mgr.reorder_playlist_tracks(playlist_id, from_idx, to_idx, 1, snapshot_id)
-            if SERIAL_DEBUG:
-                print(f"[QUEUE CMD] reorder {playlist_id} {from_idx}->{to_idx}: {'OK' if new_snap else 'FAIL'}")
+            
+            if playlist_id:
+                # Playlist reorder
+                new_snap = queue_mgr.reorder_playlist_tracks(playlist_id, from_idx, to_idx, 1, snapshot_id)
+                if SERIAL_DEBUG:
+                    print(f"[QUEUE CMD] reorder playlist {playlist_id} {from_idx}->{to_idx}: {'OK' if new_snap else 'FAIL'}")
+            else:
+                # Queue reorder - Spotify doesn't support this directly
+                # We'd need to remove and re-add to queue in order, but that's complex
+                print(f"[QUEUE CMD] Queue reorder not supported by Spotify API (from {from_idx} to {to_idx})")
+                print("[QUEUE CMD] Note: Spotify's queue is auto-managed and can only be modified by adding to it")
         
         else:
             print(f"[QUEUE CMD] Unknown action: {action}")
@@ -517,6 +600,107 @@ def _handle_like_track(cmd: dict):
         print(f"[LIKE CMD] Error: {e}")
 
 
+def _process_esp_command(cmd: dict):
+    """
+    Process a command received from ESP32 via transport manager.
+    This centralizes command handling for both Serial and TCP transports.
+    """
+    if not isinstance(cmd, dict):
+        return
+    
+    typ = cmd.get("cmd") or cmd.get("type")
+    if not typ:
+        return
+    
+    # Debug: show all received commands
+    print(f"[ESP CMD] Received: {typ}")
+    
+    if typ == "kill":
+        pid = cmd.get("pid")
+        if pid is not None:
+            try:
+                pid = int(pid)
+                proc = psutil.Process(pid)
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                    status = "terminated"
+                except psutil.TimeoutExpired:
+                    proc.kill()
+                    status = "killed"
+                if SERIAL_DEBUG:
+                    print(f"[ESP CMD] Killed pid={pid} status={status}")
+            except Exception as e:
+                if SERIAL_DEBUG:
+                    print(f"[ESP CMD] Error killing pid {pid}: {e}")
+    
+    elif typ == "play":
+        try:
+            media_play_pause()
+            try:
+                socketio.emit("command", {"command": "play"})
+            except Exception:
+                pass
+            # Ack to ESP that command was executed
+            try:
+                get_transport_manager().queue_send((json.dumps({"ack": "play"}) + "\n").encode("utf-8"), priority=False)
+            except Exception:
+                pass
+        except Exception as e:
+            if SERIAL_DEBUG:
+                print(f"[ESP CMD] Play error: {e}")
+    
+    elif typ == "pause":
+        try:
+            media_play_pause()
+            try:
+                socketio.emit("command", {"command": "pause"})
+            except Exception:
+                pass
+            # Ack to ESP that command was executed
+            try:
+                get_transport_manager().queue_send((json.dumps({"ack": "pause"}) + "\n").encode("utf-8"), priority=False)
+            except Exception:
+                pass
+        except Exception as e:
+            if SERIAL_DEBUG:
+                print(f"[ESP CMD] Pause error: {e}")
+    
+    elif typ == "next":
+        try:
+            media_next()
+            # Ack to ESP that command was executed
+            try:
+                get_transport_manager().queue_send((json.dumps({"ack": "next"}) + "\n").encode("utf-8"), priority=False)
+            except Exception:
+                pass
+        except Exception as e:
+            if SERIAL_DEBUG:
+                print(f"[ESP CMD] Next error: {e}")
+    
+    elif typ == "previous":
+        try:
+            media_previous()
+            # Ack to ESP that command was executed
+            try:
+                get_transport_manager().queue_send((json.dumps({"ack": "previous"}) + "\n").encode("utf-8"), priority=False)
+            except Exception:
+                pass
+        except Exception as e:
+            if SERIAL_DEBUG:
+                print(f"[ESP CMD] Prev error: {e}")
+    
+    elif typ == "queue_action":
+        _handle_queue_action(cmd)
+    elif typ == "playlist_action":
+        _handle_playlist_action(cmd)
+    elif typ == "like_track":
+        _handle_like_track(cmd)
+    else:
+        if SERIAL_DEBUG:
+            print(f"[ESP CMD] Unknown cmd: {cmd}")
+
+
 # =======================================================
 
 def serial_command_loop():
@@ -545,6 +729,9 @@ def serial_command_loop():
                     typ = cmd.get("cmd") or cmd.get("type")
                     if not typ:
                         continue
+                    
+                    # Debug: show all received commands
+                    print(f"[SERIAL CMD] Received: {typ}")
 
                     if typ == "kill":
                         pid = cmd.get("pid")
@@ -818,6 +1005,43 @@ def receive_source(data):
     print(f"[RECEIVED SOURCE]: {media_source}")
 
 
+@socketio.on("sendYouTubePlaylist")
+def receive_youtube_playlist(data):
+    """
+    Receive YouTube playlist data from browser extension.
+    Expected format:
+    {
+        "name": "Playlist Name",
+        "videos": [
+            {"title": "Video Title", "channel": "Channel Name", "thumbnail": "url", "video_id": "xxx", "index": 0},
+            ...
+        ],
+        "current_index": 0,
+        "total_videos": 10
+    }
+    """
+    global youtube_playlist_data
+    if isinstance(data, dict):
+        youtube_playlist_data["name"] = data.get("name", "")
+        youtube_playlist_data["videos"] = data.get("videos", [])[:10]  # Limit to 10 for ESP memory
+        youtube_playlist_data["current_index"] = data.get("current_index", 0)
+        youtube_playlist_data["total_videos"] = data.get("total_videos", 0)
+        print(f"[RECEIVED YOUTUBE PLAYLIST]: {youtube_playlist_data['name']} ({youtube_playlist_data['total_videos']} videos)")
+    else:
+        print(f"[RECEIVED YOUTUBE PLAYLIST]: Invalid format - {type(data)}")
+
+
+@socketio.on("sendYouTubePlaylistIndex")
+def receive_youtube_playlist_index(data):
+    """Receive current video index in YouTube playlist."""
+    global youtube_playlist_data
+    try:
+        youtube_playlist_data["current_index"] = int(data)
+        print(f"[RECEIVED YOUTUBE PLAYLIST INDEX]: {youtube_playlist_data['current_index']}")
+    except (ValueError, TypeError):
+        pass
+
+
 # === TASK MANAGER ADDITIONS: HTTP + SOCKET ENDPOINTS ===
 @app.route("/system_info", methods=["GET"])
 def system_info():
@@ -1068,18 +1292,23 @@ _last_seen_artwork_ts = 0
 _ARTWORK_TTL = float(os.getenv("ARTWORK_TTL_SECONDS", "5"))
 
 # Cache for Spotify playback state (used to determine priority)
+# "is_active" means Spotify has data (even if paused), "is_playing" means audio is playing
 _spotify_playback_cache = {
-    "is_active": False,
+    "is_active": False,      # Has Spotify data to show
+    "is_playing": False,     # Actually playing audio
     "last_check": 0.0,
-    "data": None
+    "data": None,
+    "last_track_uri": "",    # Track URI to detect song changes
 }
-_SPOTIFY_PLAYBACK_CHECK_TTL = 2.0  # seconds
+_SPOTIFY_PLAYBACK_CHECK_TTL = 1.0  # seconds - faster updates for smooth progress
 
 def _check_spotify_active() -> tuple:
     """
-    Check if Spotify is actively playing using the API.
-    Returns (is_active, playback_data) tuple.
-    Cached to avoid excessive API calls.
+    Check if Spotify has an active session (playing OR paused).
+    Returns (has_session, playback_data, is_playing) tuple.
+    
+    Key behavior: Returns Spotify data even when paused to prevent
+    falling back to old YouTube data during Spotify pause.
     """
     global _spotify_playback_cache
     now = time.time()
@@ -1088,20 +1317,7 @@ def _check_spotify_active() -> tuple:
     if (now - _spotify_playback_cache["last_check"]) < _SPOTIFY_PLAYBACK_CHECK_TTL:
         return (_spotify_playback_cache["is_active"], _spotify_playback_cache["data"])
     
-    # Also check if Spotify.exe is running with audio
-    spotify_audio_active = False
-    try:
-        spotify_audio_active = is_app_playing("spotify.exe")
-    except Exception:
-        pass
-    
-    if not spotify_audio_active:
-        _spotify_playback_cache["is_active"] = False
-        _spotify_playback_cache["data"] = None
-        _spotify_playback_cache["last_check"] = now
-        return (False, None)
-    
-    # Spotify app is playing audio - get playback state from API
+    # Query Spotify API for current playback state
     try:
         from control_media import load_tokens, authorized_req
         if authorized_req():
@@ -1115,13 +1331,28 @@ def _check_spotify_active() -> tuple:
             if resp.status_code == 200:
                 data = resp.json()
                 is_playing = data.get("is_playing", False)
-                _spotify_playback_cache["is_active"] = is_playing
-                _spotify_playback_cache["data"] = data if is_playing else None
+                item = data.get("item")
+                
+                # Spotify has an active session (playing OR paused with a track)
+                has_session = item is not None
+                
+                _spotify_playback_cache["is_active"] = has_session
+                _spotify_playback_cache["is_playing"] = is_playing
+                _spotify_playback_cache["data"] = data if has_session else None
                 _spotify_playback_cache["last_check"] = now
-                return (is_playing, data if is_playing else None)
+                
+                if has_session:
+                    track_uri = item.get("uri", "")
+                    if track_uri != _spotify_playback_cache.get("last_track_uri"):
+                        _spotify_playback_cache["last_track_uri"] = track_uri
+                        if SERIAL_DEBUG:
+                            print(f"[SPOTIFY] Track changed: {item.get('name', 'Unknown')}")
+                
+                return (has_session, data if has_session else None)
             elif resp.status_code == 204:
-                # No active device
+                # No active device - clear Spotify state
                 _spotify_playback_cache["is_active"] = False
+                _spotify_playback_cache["is_playing"] = False
                 _spotify_playback_cache["data"] = None
                 _spotify_playback_cache["last_check"] = now
                 return (False, None)
@@ -1137,17 +1368,18 @@ def get_media_snapshot():
     """
     Build a media snapshot from current metadata.
     
-    PRIORITY: Spotify takes precedence over browser media (YouTube, etc.) when both are playing.
-    Uses Spotify API for progress if Spotify is active, otherwise uses browser extension data.
+    PRIORITY: Spotify takes precedence over browser media (YouTube, etc.) when Spotify
+    has an active session (playing OR paused). This prevents reverting to old YouTube
+    data when Spotify is paused.
     """
     global title_data, artist_data, album_data, artwork_data
     global position_data, duration_data, is_playing_data, media_source
 
-    # Check if Spotify is actively playing - it takes priority
-    spotify_active, spotify_data = _check_spotify_active()
+    # Check if Spotify has an active session (playing OR paused)
+    spotify_has_session, spotify_data = _check_spotify_active()
     
-    if spotify_active and spotify_data:
-        # === SPOTIFY IS PLAYING - USE SPOTIFY DATA ===
+    if spotify_has_session and spotify_data:
+        # === SPOTIFY HAS ACTIVE SESSION - USE SPOTIFY DATA ===
         item = spotify_data.get("item", {})
         if item:
             # Extract Spotify metadata
@@ -1157,7 +1389,7 @@ def get_media_snapshot():
             sp_album = item.get("album", {}).get("name", "")
             sp_duration = item.get("duration_ms", 0) // 1000
             sp_position = spotify_data.get("progress_ms", 0) // 1000
-            sp_playing = spotify_data.get("is_playing", False)
+            sp_playing = spotify_data.get("is_playing", False)  # True = playing, False = paused
             
             # Get artwork
             sp_images = item.get("album", {}).get("images", [])
@@ -1233,6 +1465,25 @@ def get_media_snapshot():
     # Just indicate if artwork exists (actual image sent separately)
     media["has_artwork"] = artwork_url is not None
     media["artwork_url"] = artwork_url  # Store for separate image send
+    
+    # Add YouTube playlist data if source is YouTube and we have playlist data
+    if media_source == "youtube" and youtube_playlist_data.get("videos"):
+        # Format playlist for ESP (similar to Spotify queue format)
+        media["queue"] = []
+        for video in youtube_playlist_data["videos"][:5]:  # Limit to 5 for ESP memory
+            media["queue"].append({
+                "name": video.get("title", ""),
+                "artist": video.get("channel", ""),
+                "uri": f"youtube:video:{video.get('video_id', '')}",
+                "source": "youtube",
+            })
+        
+        # Add playlist info
+        if youtube_playlist_data.get("name"):
+            media["playlist"] = {
+                "name": youtube_playlist_data["name"],
+                "total_tracks": youtube_playlist_data.get("total_videos", 0),
+            }
 
     return media
 
@@ -1381,22 +1632,43 @@ if __name__ == "__main__":
     # CLI control panel
     threading.Thread(target=handle_user_input, daemon=True).start()
 
-    # === OPEN SERIAL PORT TO ESP ===
-    if DISABLE_AUTO_SERIAL:
-        print("[SERIAL] Auto-open disabled via DISABLE_AUTO_SERIAL")
-        ser = None
-    else:
-        try:
-            print(f"[SERIAL] Opening {SERIAL_PORT} at {SERIAL_BAUD}...")
-            ser = serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
-            print("[SERIAL] Connected to ESP.")
-        except Exception as e:
-            print(f"[SERIAL ERROR] Could not open port {SERIAL_PORT}: {e}")
-            ser = None
-    # =================================
+    # === INITIALIZE TRANSPORT MANAGER ===
+    transport_mgr = get_transport_manager()
+    transport_mgr.debug = SERIAL_DEBUG
+    
+    # Setup transports based on TRANSPORT_MODE
+    if TRANSPORT_MODE in ("serial", "both"):
+        if DISABLE_AUTO_SERIAL:
+            print("[TRANSPORT] Serial disabled via DISABLE_AUTO_SERIAL")
+        else:
+            print(f"[TRANSPORT] Opening Serial {SERIAL_PORT} at {SERIAL_BAUD}...")
+            serial_transport = transport_mgr.add_serial(SERIAL_PORT, SERIAL_BAUD)
+            if serial_transport:
+                # Keep legacy 'ser' reference for backward compatibility
+                ser = serial_transport._serial
+                print("[TRANSPORT] Serial connected")
+            else:
+                print(f"[TRANSPORT] Serial failed to open {SERIAL_PORT}")
+    
+    if TRANSPORT_MODE in ("tcp", "both"):
+        print(f"[TRANSPORT] Starting TCP server on {TCP_HOST}:{TCP_PORT}...")
+        tcp_transport = transport_mgr.add_tcp_server(TCP_HOST, TCP_PORT)
+        if tcp_transport:
+            print(f"[TRANSPORT] TCP server listening - ESP32 can connect to port {TCP_PORT}")
+        else:
+            print("[TRANSPORT] TCP server failed to start")
+    
+    # Set command callback for processing ESP32 commands
+    transport_mgr.set_command_callback(_process_esp_command)
+    
+    # Start transport threads
+    transport_mgr.start()
+    # =====================================
 
-    # Start serial command reader (if serial opened)
-    if ser is not None:
+    # Start legacy serial command reader (if serial opened and transport manager not handling it)
+    # Note: Transport manager now handles reading, but we keep serial_command_loop for backward compat
+    if ser is not None and TRANSPORT_MODE == "serial":
+        # Only run old loops in pure serial mode for backward compatibility
         threading.Thread(target=serial_command_loop, daemon=True).start()
         threading.Thread(target=_serial_writer_loop, daemon=True).start()
 

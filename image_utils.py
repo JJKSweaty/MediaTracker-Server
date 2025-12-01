@@ -85,12 +85,26 @@ def get_artwork_png_b64(artwork_url: str) -> str:
         return _last_png_b64
     
     try:
-        # Request JPEG/PNG explicitly to avoid AVIF (which PIL doesn't support natively)
+        # For YouTube thumbnails, try to get a guaranteed JPEG URL
+        # YouTube serves AVIF by default which PIL can't always handle
+        url_to_fetch = artwork_url
+        if 'ytimg.com' in artwork_url or 'youtube.com' in artwork_url:
+            # YouTube thumbnail - convert to sddefault.jpg for reliable JPEG
+            # Common patterns: vi/VIDEO_ID/xxx.jpg or vi_webp/VIDEO_ID/xxx.webp
+            import re
+            match = re.search(r'(?:vi|vi_webp)/([a-zA-Z0-9_-]{11})/', artwork_url)
+            if match:
+                video_id = match.group(1)
+                # Use sddefault for good quality without AVIF
+                url_to_fetch = f"https://img.youtube.com/vi/{video_id}/sddefault.jpg"
+                print(f"[IMAGE] YouTube: Using JPEG thumbnail for {video_id}")
+        
+        # Request JPEG/PNG explicitly to avoid AVIF
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept': 'image/jpeg,image/png,image/webp,image/*;q=0.8',
         }
-        resp = requests.get(artwork_url, timeout=5, headers=headers)
+        resp = requests.get(url_to_fetch, timeout=5, headers=headers)
         resp.raise_for_status()
         
         # Check if we got actual image data
