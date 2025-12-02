@@ -35,6 +35,14 @@ try:
 except ImportError:
     HAS_GPU = False
     print("[INFO] GPUtil not installed - GPU monitoring disabled. Install with: pip install GPUtil")
+
+# Discord voice monitoring (optional - requires discord.py)
+try:
+    from discord_bot import DiscordVoiceBot, get_discord_bot, init_discord_bot, stop_discord_bot
+    HAS_DISCORD = True
+except ImportError:
+    HAS_DISCORD = False
+    print("[INFO] discord_bot not available - Discord monitoring disabled.")
 # ===============================
 
 load_dotenv()
@@ -86,6 +94,14 @@ TRANSPORT_MODE = os.getenv("TRANSPORT_MODE", "both").lower()
 TCP_PORT = int(os.getenv("TCP_PORT", "5555"))
 TCP_HOST = os.getenv("TCP_HOST", "0.0.0.0")
 # ========================================
+
+# === DISCORD CONFIG (Voice call monitoring) ===
+# Discord bot token for voice monitoring
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN", "").strip('"')
+DISCORD_ENABLED = os.getenv("DISCORD_ENABLED", "0") in ("1", "true", "True")
+# Your Discord user ID - bot will auto-join when you join voice
+DISCORD_USER_ID = int(os.getenv("DISCORD_USER_ID", "0"))
+# ==============================================
 
 # Basic validation to help debug Spotify auth issues quickly
 if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
@@ -234,6 +250,30 @@ def get_system_snapshot():
     return data
 
 
+def get_discord_snapshot():
+    """
+    Get Discord voice call state for ESP32 display.
+    Returns None if Discord monitoring is disabled or not in a call.
+    Uses compact keys (c, ch, sm, sd, u, n, m, d, s) to minimize JSON size.
+    """
+    if not HAS_DISCORD or not DISCORD_ENABLED:
+        return None
+    
+    try:
+        bot = get_discord_bot()
+        if bot and bot.is_running:
+            data = bot.to_esp32_json()
+            if data and data.get("c"):
+                if SERIAL_DEBUG:
+                    print(f"[DISCORD] Sending to ESP32: {data}")
+            return data
+        return None
+    except Exception as e:
+        if SERIAL_DEBUG:
+            print(f"[DISCORD] Error getting snapshot: {e}")
+        return None
+
+
 # Artwork fetching state (shared between threads)
 _artwork_state = {
     "pending_url": None,
@@ -313,6 +353,11 @@ def system_monitor_loop(interval=2.0):
                             print(f"[ARTWORK] Queued for fetch: {artwork_url[:60]}...")
             
             snapshot["media"] = media
+
+        # Attach Discord voice call state (if available)
+        discord_data = get_discord_snapshot()
+        if discord_data is not None:
+            snapshot["discord"] = discord_data
 
         # 1) Emit to web clients via Socket.IO
         socketio.emit("system_info", snapshot)
@@ -813,9 +858,66 @@ def _process_esp_command(cmd: dict):
         _handle_shuffle(cmd)
     elif typ == "repeat":
         _handle_repeat(cmd)
+    
+    # Discord commands
+    elif typ == "discord_user_mute":
+        _handle_discord_user_mute(cmd)
+    elif typ == "discord_user_deafen":
+        _handle_discord_user_deafen(cmd)
+    elif typ == "discord_soundboard":
+        _handle_discord_soundboard(cmd)
+    
     else:
         if SERIAL_DEBUG:
             print(f"[ESP CMD] Unknown cmd: {cmd}")
+
+
+def _handle_discord_user_mute(cmd):
+    """Server mute a specific user in voice channel."""
+    idx = cmd.get("idx", 0)
+    if not HAS_DISCORD:
+        return
+    try:
+        bot = get_discord_bot()
+        if bot and bot.is_running:
+            bot.server_mute_user(idx)
+            print(f"[DISCORD] Server mute user idx={idx}")
+    except Exception as e:
+        print(f"[DISCORD] User mute error: {e}")
+
+
+def _handle_discord_user_deafen(cmd):
+    """Server deafen a specific user in voice channel."""
+    idx = cmd.get("idx", 0)
+    if not HAS_DISCORD:
+        return
+    try:
+        bot = get_discord_bot()
+        if bot and bot.is_running:
+            bot.server_deafen_user(idx)
+            print(f"[DISCORD] Server deafen user idx={idx}")
+    except Exception as e:
+        print(f"[DISCORD] User deafen error: {e}")
+
+
+def _handle_discord_soundboard(cmd):
+    """Play a soundboard sound in Discord voice channel."""
+    sound_idx = cmd.get("sound", 0)
+    soundboard_names = [
+        "Airhorn", "Sad Trombone", "Cricket", "Rimshot",
+        "Golf Clap", "Quack", "Fart", "Ba Dum Tss"
+    ]
+    if not HAS_DISCORD:
+        print("[DISCORD] Discord module not available")
+        return
+    try:
+        bot = get_discord_bot()
+        if bot and bot.is_running:
+            bot.play_soundboard(sound_idx)
+            sound_name = soundboard_names[sound_idx] if 0 <= sound_idx < len(soundboard_names) else "Unknown"
+            print(f"[DISCORD] Soundboard play: {sound_name}")
+    except Exception as e:
+        print(f"[DISCORD] Soundboard error: {e}")
 
 
 # =======================================================
@@ -1810,6 +1912,25 @@ if __name__ == "__main__":
 
     # Prime psutil counters
     prime_psutil()
+
+    # === START DISCORD BOT (if enabled) ===
+    if HAS_DISCORD and DISCORD_ENABLED and DISCORD_TOKEN:
+        print("[DISCORD] Starting Discord voice monitor bot...")
+        try:
+            bot = init_discord_bot(DISCORD_TOKEN, DISCORD_USER_ID)
+            if bot and bot.start():
+                print("[DISCORD] Bot started successfully!")
+                if DISCORD_USER_ID:
+                    print(f"[DISCORD] Will auto-join when user ID {DISCORD_USER_ID} joins voice")
+            else:
+                print("[DISCORD] Bot failed to start")
+        except Exception as e:
+            print(f"[DISCORD] Failed to start bot: {e}")
+    elif DISCORD_ENABLED and not DISCORD_TOKEN:
+        print("[DISCORD] DISCORD_ENABLED is set but DISCORD_TOKEN is missing in .env")
+    elif DISCORD_ENABLED and not HAS_DISCORD:
+        print("[DISCORD] DISCORD_ENABLED is set but discord_bot module not available")
+    # ==========================================
 
     # Start background system monitor (can be tuned: 0.05 = 20 Hz, 0.1 = 10 Hz)
     socketio.start_background_task(system_monitor_loop, 0.05)

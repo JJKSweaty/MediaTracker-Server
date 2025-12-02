@@ -431,7 +431,6 @@ def get_spotify_progress():
 
 # ========================================
 # KEYBOARD MEDIA KEY CONTROLS
-# Works with any media player (Spotify, VLC, YouTube, etc.)
 # ========================================
 import ctypes
 

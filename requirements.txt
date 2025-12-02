@@ -7,3 +7,7 @@ psutil
 pyserial
 GPUtil
 Pillow
+# Discord voice monitoring (official bot)
+discord.py
+aiohttp
+pynacl
